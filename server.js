@@ -1,49 +1,43 @@
 /**
- * Twilio ↔ ElevenLabs Real-Time Audio Bridge (v5 - SILENCE FRAMES FIX)
- *
- * ✅ FIX: Always send frames to Twilio (silence when no agent audio)
- *         This prevents Twilio from closing the connection due to inactivity
+ * Twilio ↔ ElevenLabs Real-Time Audio Bridge (fixed)
+ * - Twilio Media Streams (8kHz mu-law) <-> ElevenLabs ConvAI (16kHz PCM16)
+ * - Robust anti-echo + queue-drain handling + correct ElevenLabs message types
  *
  * Env:
- *  - ELEVENLABS_API_KEY
- *  - ELEVENLABS_AGENT_ID
- *  - PORT (default 8080)
+ *   ELEVENLABS_API_KEY
+ *   ELEVENLABS_AGENT_ID
+ *   PORT (optional)
  */
 
-const http = require("http");
 const WebSocket = require("ws");
+const http = require("http");
 
 const PORT = process.env.PORT || 8080;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
-// -------------------- Audio constants --------------------
-const ELEVEN_SAMPLE_RATE = 16000;
-const TWILIO_FRAME_BYTES = 160;           // 20ms of 8kHz mu-law
-const PLAYER_INTERVAL_MS = 20;
+if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
+  console.warn("⚠️ Missing ELEVENLABS_API_KEY or ELEVENLABS_AGENT_ID");
+}
 
-// ✅ Silence frame (mu-law 0xFF = silence)
-const MULAW_SILENCE_FRAME = Buffer.alloc(TWILIO_FRAME_BYTES, 0xff);
+/* ───────────── Audio constants ───────────── */
 
-// -------------------- VAD / Turn config --------------------
-const ENERGY_THRESHOLD = 0.02;
-const SILENCE_MS_TO_COMMIT = 800;
-const MIN_SPOKE_MS_TO_COMMIT = 400;
-const ANTI_ECHO_HOLD_MS = 600;
+const TWILIO_SR = 8000;
+const ELEVEN_SR = 16000;
 
-// Greeting
-const GREETING_DELAY_MS = 700;
+// Twilio wants 20ms frames at 8kHz mu-law => 160 bytes
+const TWILIO_FRAME_BYTES = 160;
+const MULAW_SILENCE_FRAME = Buffer.alloc(TWILIO_FRAME_BYTES, 0xff); // μ-law silence-ish
 
-// ============================================================================
-// Mu-law (G.711) utils
-// ============================================================================
+/* ───────────── Mu-law codec ───────────── */
+
 const MULAW_DECODE_TABLE = new Int16Array(256);
 (function initMulawTable() {
   for (let i = 0; i < 256; i++) {
     let mulaw = ~i;
     let sign = (mulaw & 0x80) ? -1 : 1;
     let exponent = (mulaw >> 4) & 0x07;
-    let mantissa = mulaw & 0x0F;
+    let mantissa = mulaw & 0x0f;
     let sample = (mantissa << 3) + 0x84;
     sample <<= exponent;
     sample -= 0x84;
@@ -52,13 +46,13 @@ const MULAW_DECODE_TABLE = new Int16Array(256);
 })();
 
 function decodeMulaw(buf) {
-  const pcm = new Int16Array(buf.length);
-  for (let i = 0; i < buf.length; i++) pcm[i] = MULAW_DECODE_TABLE[buf[i]];
-  return pcm;
+  const out = new Int16Array(buf.length);
+  for (let i = 0; i < buf.length; i++) out[i] = MULAW_DECODE_TABLE[buf[i]];
+  return out;
 }
 
 function linearToMulaw(sample) {
-  const MULAW_MAX = 0x1FFF;
+  const MULAW_MAX = 0x1fff;
   const MULAW_BIAS = 33;
 
   let sign = (sample >> 8) & 0x80;
@@ -66,162 +60,180 @@ function linearToMulaw(sample) {
   if (sample > MULAW_MAX) sample = MULAW_MAX;
 
   sample += MULAW_BIAS;
-  let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
 
-  let mantissa = (sample >> (exponent + 3)) & 0x0F;
+  let exponent = 7;
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1);
+
+  let mantissa = (sample >> (exponent + 3)) & 0x0f;
   let mulawByte = ~(sign | (exponent << 4) | mantissa);
   return mulawByte & 0xff;
 }
 
-function encodeMulaw(pcmSamples) {
-  const mulaw = Buffer.alloc(pcmSamples.length);
-  for (let i = 0; i < pcmSamples.length; i++) mulaw[i] = linearToMulaw(pcmSamples[i]);
-  return mulaw;
+function encodeMulaw(pcm) {
+  const out = Buffer.alloc(pcm.length);
+  for (let i = 0; i < pcm.length; i++) out[i] = linearToMulaw(pcm[i]);
+  return out;
 }
 
-function upsample8to16(pcm8k) {
-  const out = new Int16Array(pcm8k.length * 2);
-  for (let i = 0; i < pcm8k.length; i++) {
-    const a = pcm8k[i];
-    const b = pcm8k[Math.min(i + 1, pcm8k.length - 1)];
-    out[i * 2] = a;
-    out[i * 2 + 1] = (a + b) >> 1;
+function upsample8to16(samples8k) {
+  const out = new Int16Array(samples8k.length * 2);
+  for (let i = 0; i < samples8k.length; i++) {
+    const curr = samples8k[i];
+    const next = samples8k[Math.min(i + 1, samples8k.length - 1)];
+    out[i * 2] = curr;
+    out[i * 2 + 1] = (curr + next) >> 1;
   }
   return out;
 }
 
-function downsample16to8(pcm16k) {
-  const out = new Int16Array(Math.floor(pcm16k.length / 2));
-  for (let i = 0; i < out.length; i++) out[i] = pcm16k[i * 2];
+function downsample16to8(samples16k) {
+  const out = new Int16Array(Math.floor(samples16k.length / 2));
+  for (let i = 0; i < out.length; i++) out[i] = samples16k[i * 2];
   return out;
 }
 
-function pcm16ToBase64(pcm) {
-  const buf = Buffer.alloc(pcm.length * 2);
-  for (let i = 0; i < pcm.length; i++) buf.writeInt16LE(pcm[i], i * 2);
+function pcm16ToBase64(samples) {
+  const buf = Buffer.alloc(samples.length * 2);
+  for (let i = 0; i < samples.length; i++) buf.writeInt16LE(samples[i], i * 2);
   return buf.toString("base64");
 }
 
 function base64ToPcm16(b64) {
   const buf = Buffer.from(b64, "base64");
-  const pcm = new Int16Array(buf.length / 2);
-  for (let i = 0; i < pcm.length; i++) pcm[i] = buf.readInt16LE(i * 2);
-  return pcm;
+  const out = new Int16Array(buf.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = buf.readInt16LE(i * 2);
+  return out;
 }
 
-function rmsEnergy(pcm16) {
+function rmsEnergy(pcm) {
   let sum = 0;
-  for (let i = 0; i < pcm16.length; i++) {
-    const x = pcm16[i] / 32768;
+  for (let i = 0; i < pcm.length; i++) {
+    const x = pcm[i] / 32768;
     sum += x * x;
   }
-  return Math.sqrt(sum / pcm16.length);
+  return Math.sqrt(sum / pcm.length);
 }
 
-function silence16kBase64(ms = 100) {
-  const samples = Math.floor((ms / 1000) * ELEVEN_SAMPLE_RATE);
-  const pcm = new Int16Array(samples);
-  return pcm16ToBase64(pcm);
-}
+/* ───────────── ElevenLabs ConvAI WS client ───────────── */
 
-// ============================================================================
-// ElevenLabs client
-// ============================================================================
 class ElevenLabs {
-  constructor({ apiKey, agentId, onAudio, onAgentText, onUserText, onReady, onClose }) {
+  constructor({ apiKey, agentId, onAudio, onText, onUserText, onLogPrefix }) {
     this.apiKey = apiKey;
     this.agentId = agentId;
     this.onAudio = onAudio;
-    this.onAgentText = onAgentText;
+    this.onText = onText;
     this.onUserText = onUserText;
-    this.onReady = onReady;
-    this.onClose = onClose;
-
+    this.onLogPrefix = onLogPrefix || "";
     this.ws = null;
     this.ready = false;
     this.open = false;
   }
 
-  async connect() {
-    const url = `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${encodeURIComponent(this.agentId)}`;
-    const res = await fetch(url, { headers: { "xi-api-key": this.apiKey } });
-    if (!res.ok) throw new Error(`ElevenLabs signed-url failed: ${await res.text()}`);
-    const { signed_url } = await res.json();
-
-    this.ws = new WebSocket(signed_url);
-
-    this.ws.on("open", () => {
-      this.open = true;
-    });
-
-    this.ws.on("message", (data) => {
-      let msg;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-
-      if (msg.type === "ping" || msg.ping_event) {
-        const eid = msg.ping_event?.event_id ?? msg.event_id;
-        if (eid && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ type: "pong", event_id: eid }));
-        }
-        return;
-      }
-
-      if (msg.type === "conversation_initiation_metadata") {
-        this.ready = true;
-        this.onReady?.();
-        return;
-      }
-
-      if (msg.type === "audio") {
-        const b64 =
-          msg.audio_event?.audio_base_64 ||
-          msg.audio?.chunk ||
-          msg.audio?.audio_base_64 ||
-          msg.audio_event?.chunk;
-        if (b64) this.onAudio?.(b64);
-        return;
-      }
-
-      if (msg.type === "agent_response") {
-        const text = msg.agent_response_event?.agent_response;
-        if (text) this.onAgentText?.(text);
-        return;
-      }
-
-      if (msg.type === "user_transcript") {
-        const text = msg.user_transcription_event?.user_transcript;
-        if (text) this.onUserText?.(text);
-        return;
-      }
-    });
-
-    this.ws.on("close", (code, reason) => {
-      this.open = false;
-      this.ready = false;
-      this.onClose?.(code, reason?.toString?.() || "");
-    });
-
-    this.ws.on("error", () => {});
+  log(msg) {
+    console.log(`${this.onLogPrefix}[ElevenLabs] ${msg}`);
   }
 
-  sendAudio(b64Pcm16_16k) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) return;
+  async connect() {
+    const url = await this.getSignedUrl();
+    return new Promise((resolve, reject) => {
+      this.ws = new WebSocket(url);
+
+      this.ws.on("open", () => {
+        this.open = true;
+        this.log("WS open");
+      });
+
+      this.ws.on("message", (d) => {
+        let m;
+        try { m = JSON.parse(d.toString()); } catch { return; }
+
+        if (m.type === "conversation_initiation_metadata") {
+          this.ready = true;
+          this.log("✅ ready");
+        }
+
+        if (m.type === "audio") {
+          const chunk =
+            m.audio?.chunk ||
+            m.audio_event?.audio_base_64 ||
+            m.audio_event?.chunk ||
+            m.audio?.audio_base_64;
+
+          if (chunk) this.onAudio?.(chunk);
+        }
+
+        if (m.type === "agent_response") {
+          const t = m.agent_response_event?.agent_response;
+          if (t) this.onText?.(t);
+        }
+
+        if (m.type === "user_transcript") {
+          const t = m.user_transcription_event?.user_transcript;
+          if (t) this.onUserText?.(t);
+        }
+
+        if (m.type === "ping") {
+          const id = m.ping_event?.event_id || m.event_id;
+          if (id && this.ws?.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: "pong", event_id: id }));
+          }
+        }
+      });
+
+      this.ws.on("close", (code, reason) => {
+        this.log(`WS close code=${code} reason=${reason?.toString?.() || ""}`);
+        this.open = false;
+        this.ready = false;
+      });
+
+      this.ws.on("error", (err) => {
+        this.log(`WS error: ${err?.message || err}`);
+        reject(err);
+      });
+
+      // resolve quickly; readiness is via waitReady()
+      resolve();
+    });
+  }
+
+  async getSignedUrl() {
+    const res = await fetch(
+      `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${this.agentId}`,
+      { headers: { "xi-api-key": this.apiKey } }
+    );
+    if (!res.ok) {
+      const t = await res.text();
+      throw new Error(`Signed URL error: ${t}`);
+    }
+    const j = await res.json();
+    return j.signed_url;
+  }
+
+  async waitReady(ms = 6000) {
+    const start = Date.now();
+    while (Date.now() - start < ms) {
+      if (this.ready) return true;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    return false;
+  }
+
+  sendAudio(b64) {
+    if (!this.open || !this.ready) return;
+    // ✅ REQUIRED: include type
     this.ws.send(JSON.stringify({
       type: "user_audio_chunk",
-      user_audio_chunk: b64Pcm16_16k,
+      user_audio_chunk: b64
     }));
   }
 
   commit() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) return;
-    this.ws.send(JSON.stringify({ type: "user_audio_commit" }));
-  }
-
-  triggerGreeting() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) return;
-    this.sendAudio(silence16kBase64(120));
-    this.commit();
+    if (!this.open || !this.ready) return;
+    // ✅ REQUIRED: include type
+    this.ws.send(JSON.stringify({
+      type: "user_audio_commit",
+      user_audio_commit: true
+    }));
   }
 
   close() {
@@ -229,84 +241,93 @@ class ElevenLabs {
   }
 }
 
-// ============================================================================
-// Call Session
-// ============================================================================
+/* ───────────── Call session ───────────── */
+
 class CallSession {
   constructor(streamSid, twilioWs) {
     this.streamSid = streamSid;
     this.twilioWs = twilioWs;
 
-    this.closed = false;
+    this.isActive = true;
 
-    // Twilio playback
+    // Twilio output buffer (mu-law)
     this.outBuf = Buffer.alloc(0);
-    this.playTimer = null;
     this.frames = 0;
 
-    // Anti-echo tracking
+    // Agent audio timing
     this.lastAgentAudioAt = 0;
-    this.bufferEmptiedAt = 0;
 
-    // VAD local
+    // User VAD / commit
+    this.ENERGY_THRESHOLD = 0.02; // tune to your line
+    this.SILENCE_MS_TO_COMMIT = 800;
+    this.MIN_SPOKE_MS = 500;
+
     this.userTalking = false;
-    this.userSpeechStartAt = 0;
+    this.userSpeechStartAt = null;
     this.lastVoiceAt = 0;
 
+    // Anti-echo
+    this.ANTI_ECHO_HOLD_MS = 800; // short cushion after last agent audio
+
+    // Timers
+    this.playTimer = null;
+    this.commitTimer = null;
+
+    // ElevenLabs
     this.eleven = null;
 
     console.log(`[Session ${this.streamSid}] Created`);
   }
 
   async start() {
-    if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
-      console.log(`[Session ${this.streamSid}] Missing ELEVEN env vars`);
-      this.close("missing_env");
-      return;
-    }
-
     this.eleven = new ElevenLabs({
       apiKey: ELEVENLABS_API_KEY,
       agentId: ELEVENLABS_AGENT_ID,
-      onReady: () => console.log(`[Session ${this.streamSid}] [ElevenLabs] ✅ ready`),
-      onAudio: (b64) => this.onElevenAudio(b64),
-      onAgentText: (t) => console.log(`[Session ${this.streamSid}] [ElevenLabs] 💬 Agent: ${t.substring(0, 90)}`),
+      onAudio: (b64) => this.fromEleven(b64),
+      onText: (t) => console.log(`[Session ${this.streamSid}] [ElevenLabs] 💬 Agent: ${t.substring(0, 100)}`),
       onUserText: (t) => console.log(`[Session ${this.streamSid}] [ElevenLabs] 👤 User: ${t}`),
-      onClose: (c, r) => console.log(`[Session ${this.streamSid}] [ElevenLabs] WS close code=${c} reason=${r}`),
+      onLogPrefix: `[Session ${this.streamSid}] `
     });
 
     await this.eleven.connect();
+    const ok = await this.eleven.waitReady(6000);
+    if (!ok) console.log(`[Session ${this.streamSid}] ⚠️ ElevenLabs not ready in time`);
+
     console.log(`[Session ${this.streamSid}] ElevenLabs connected`);
 
     this.startPlayer();
 
-    setTimeout(() => {
-      if (!this.closed) this.eleven?.triggerGreeting();
-    }, GREETING_DELAY_MS);
+    // auto-commit checker
+    this.commitTimer = setInterval(() => this.maybeCommit(), 100);
+
+    // Trigger greeting AFTER ready (commit an empty turn)
+    this.eleven.commit();
   }
 
-  // ---- Twilio outbound player (20ms frames) ----
-  // ✅ FIX: ALWAYS send a frame (audio or silence) to keep connection alive
   startPlayer() {
     if (this.playTimer) return;
 
     this.playTimer = setInterval(() => {
-      if (this.closed) return;
+      if (!this.isActive) return;
       if (this.twilioWs.readyState !== WebSocket.OPEN) return;
 
-      let frame;
+      const now = Date.now();
 
+      // ✅ clear "ghost tail" (<1 frame) if agent audio stopped a bit ago
+      if (
+        this.outBuf.length > 0 &&
+        this.outBuf.length < TWILIO_FRAME_BYTES &&
+        (now - this.lastAgentAudioAt) > 300
+      ) {
+        this.outBuf = Buffer.alloc(0);
+      }
+
+      // Need a full frame to send; otherwise just send silence
+      let frame;
       if (this.outBuf.length >= TWILIO_FRAME_BYTES) {
-        // Send agent audio
         frame = this.outBuf.subarray(0, TWILIO_FRAME_BYTES);
         this.outBuf = this.outBuf.subarray(TWILIO_FRAME_BYTES);
-
-        // Track when buffer becomes empty
-        if (this.outBuf.length < TWILIO_FRAME_BYTES) {
-          this.bufferEmptiedAt = Date.now();
-        }
       } else {
-        // ✅ Send silence frame to keep Twilio alive
         frame = MULAW_SILENCE_FRAME;
       }
 
@@ -314,219 +335,175 @@ class CallSession {
         this.twilioWs.send(JSON.stringify({
           event: "media",
           streamSid: this.streamSid,
-          media: { payload: frame.toString("base64") },
+          media: { payload: frame.toString("base64") }
         }));
-
-        this.frames++;
-        if (this.frames % 50 === 0) {
-          console.log(`[Twilio ${this.streamSid.slice(0, 8)}] ▶️ frames=${this.frames} queue=${this.outBuf.length}`);
-        }
       } catch {
-        this.close("twilio_send_error");
+        return this.close("twilio_send_error");
       }
-    }, PLAYER_INTERVAL_MS);
+
+      this.frames++;
+      if (this.frames % 50 === 0) {
+        console.log(`[Twilio ${this.streamSid.slice(0, 8)}] ▶️ frames=${this.frames} queue=${this.outBuf.length}`);
+      }
+    }, 20);
   }
 
-  // ✅ Check if agent is currently speaking (for anti-echo)
-  isAgentSpeaking() {
-    const now = Date.now();
+  fromTwilio(b64) {
+    if (!this.isActive || !this.eleven) return;
 
-    // Agent speaking if buffer has audio
-    if (this.outBuf.length > 0) {
-      return true;
-    }
-
-    // Or if buffer just emptied recently
-    if (this.bufferEmptiedAt > 0 && (now - this.bufferEmptiedAt) < ANTI_ECHO_HOLD_MS) {
-      return true;
-    }
-
-    return false;
-  }
-
-  // ---- Receive Eleven audio (PCM16@16k base64) -> Twilio mulaw frames ----
-  onElevenAudio(b64Pcm16) {
-    if (this.closed) return;
-
-    this.lastAgentAudioAt = Date.now();
-
-    const pcm16k = base64ToPcm16(b64Pcm16);
-    const pcm8k = downsample16to8(pcm16k);
-    const mulaw = encodeMulaw(pcm8k);
-
-    this.outBuf = Buffer.concat([this.outBuf, mulaw]);
-  }
-
-  // ---- Receive Twilio inbound audio (mulaw base64) -> Eleven PCM16@16k ----
-  fromTwilio(b64Mulaw) {
-    if (this.closed || !this.eleven) return;
-
-    const now = Date.now();
-
-    // ✅ Anti-echo: don't process user audio while agent is speaking
-    if (this.isAgentSpeaking()) {
-      return;
-    }
-
-    let pcm8;
     try {
-      pcm8 = decodeMulaw(Buffer.from(b64Mulaw, "base64"));
-    } catch {
-      return;
-    }
+      const pcm8 = decodeMulaw(Buffer.from(b64, "base64"));
+      const e = rmsEnergy(pcm8);
+      const now = Date.now();
 
-    const e = rmsEnergy(pcm8);
+      // ✅ Robust anti-echo:
+      // - if there is still audio queued to play, do NOT listen
+      // - plus a short cushion after last agent audio
+      const inAntiEcho =
+        (this.outBuf.length > 0) ||
+        (now - this.lastAgentAudioAt < this.ANTI_ECHO_HOLD_MS);
 
-    // VAD tracking
-    if (e > ENERGY_THRESHOLD) {
-      this.lastVoiceAt = now;
-      if (!this.userTalking) {
-        this.userTalking = true;
-        this.userSpeechStartAt = now;
-        console.log(`[Session ${this.streamSid.slice(0, 8)}] 🎤 User started speaking`);
+      if (inAntiEcho) return;
+
+      // VAD start/keep talking
+      if (e > this.ENERGY_THRESHOLD) {
+        this.lastVoiceAt = now;
+        if (!this.userTalking) {
+          this.userTalking = true;
+          this.userSpeechStartAt = now;
+          console.log(`[Session ${this.streamSid.slice(0, 8)}] 🎤 User started speaking (energy=${e.toFixed(3)})`);
+        }
       }
-    }
 
-    // ✅ Always send audio to ElevenLabs (when not in anti-echo)
-    const pcm16 = upsample8to16(pcm8);
-    this.eleven.sendAudio(pcm16ToBase64(pcm16));
-
-    // Auto-commit decision
-    if (this.userTalking) {
-      const spokeMs = now - this.userSpeechStartAt;
-      const silenceMs = this.lastVoiceAt ? (now - this.lastVoiceAt) : 0;
-
-      if (silenceMs >= SILENCE_MS_TO_COMMIT && spokeMs >= MIN_SPOKE_MS_TO_COMMIT) {
-        console.log(`[Session ${this.streamSid}] ⚡ Auto-commit (silence ${silenceMs}ms, spoke ${spokeMs}ms)`);
-        this.userTalking = false;
-        this.userSpeechStartAt = 0;
-        this.lastVoiceAt = 0;
-        this.eleven.commit();
+      // If user is in talking mode, keep streaming audio even if energy dips
+      if (this.userTalking) {
+        const pcm16 = upsample8to16(pcm8);
+        this.eleven.sendAudio(pcm16ToBase64(pcm16));
       }
+    } catch (err) {
+      console.log(`[Session ${this.streamSid}] fromTwilio error: ${err?.message || err}`);
+      this.close("from_twilio_error");
+    }
+  }
+
+  maybeCommit() {
+    if (!this.isActive) return;
+    if (!this.userTalking) return;
+
+    const now = Date.now();
+    const silentFor = now - this.lastVoiceAt;
+    const spokeFor = this.userSpeechStartAt ? (now - this.userSpeechStartAt) : 0;
+
+    if (silentFor >= this.SILENCE_MS_TO_COMMIT && spokeFor >= this.MIN_SPOKE_MS) {
+      console.log(`[Session ${this.streamSid}] ⚡ Auto-commit (silence ${silentFor}ms, spoke ${spokeFor}ms)`);
+      this.userTalking = false;
+      this.userSpeechStartAt = null;
+      this.eleven?.commit();
+    }
+  }
+
+  fromEleven(b64) {
+    if (!this.isActive) return;
+    try {
+      this.lastAgentAudioAt = Date.now();
+
+      const pcm16 = base64ToPcm16(b64);
+      const pcm8 = downsample16to8(pcm16);
+      const mulaw = encodeMulaw(pcm8);
+
+      this.outBuf = Buffer.concat([this.outBuf, mulaw]);
+    } catch (err) {
+      console.log(`[Session ${this.streamSid}] fromEleven error: ${err?.message || err}`);
+      this.close("from_eleven_error");
     }
   }
 
   close(reason = "unknown") {
-    if (this.closed) return;
-    this.closed = true;
+    if (!this.isActive) return;
+    this.isActive = false;
     console.log(`[Session ${this.streamSid}] Closing reason=${reason}`);
     try { clearInterval(this.playTimer); } catch {}
+    try { clearInterval(this.commitTimer); } catch {}
     try { this.eleven?.close(); } catch {}
   }
 }
 
-// ============================================================================
-// HTTP server (TwiML + health) + WS /twilio-stream
-// ============================================================================
+/* ───────────── HTTP + WS server ───────────── */
+
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ ok: true, ts: new Date().toISOString() }));
-    return;
+    res.writeHead(200, { "Content-Type": "text/plain" });
+    return res.end("ok");
   }
 
   if (req.url === "/twiml") {
-    const host = req.headers.host;
-    const wsUrl = `wss://${host}/twilio-stream`;
-
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${wsUrl}">
-      <Parameter name="language" value="es-ES"/>
-    </Stream>
-  </Connect>
-</Response>`;
+    // IMPORTANT: Twilio needs a FULL https URL. In Twilio console you must set:
+    // https://<your-railway-domain>/twiml
+    const wsUrl = `wss://${req.headers.host}/twilio-stream`;
 
     res.writeHead(200, { "Content-Type": "application/xml" });
-    res.end(twiml);
-    return;
+    return res.end(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}" />
+  </Connect>
+</Response>`);
   }
 
   res.writeHead(404);
-  res.end("Not found");
+  res.end("not found");
 });
 
 const wss = new WebSocket.Server({ server });
 
-const sessions = new Map();
-
 wss.on("connection", (ws, req) => {
   console.log(`[Server] New WebSocket connection from ${req.url}`);
-  if (req.url !== "/twilio-stream") {
-    ws.close();
-    return;
-  }
 
   let session = null;
 
-  ws.on("message", async (data) => {
-    let msg;
-    try { msg = JSON.parse(data.toString()); } catch { return; }
+  ws.on("close", (code, reason) => {
+    console.log(`[Twilio] WS close code=${code} reason=${reason?.toString?.() || ""}`);
+    session?.close("twilio_ws_close");
+    session = null;
+  });
 
-    if (msg.event === "connected") {
-      console.log("[Twilio] Connected");
-      return;
-    }
+  ws.on("error", (err) => {
+    console.log(`[Twilio] WS error: ${err?.message || err}`);
+    session?.close("twilio_ws_error");
+    session = null;
+  });
 
-    if (msg.event === "start") {
-      const streamSid = msg.start?.streamSid;
-      const callSid = msg.start?.callSid;
+  ws.on("message", async (d) => {
+    let m;
+    try { m = JSON.parse(d.toString()); } catch { return; }
+
+    if (m.event === "connected") console.log("[Twilio] Connected");
+
+    if (m.event === "start") {
+      const { streamSid, callSid } = m.start;
       console.log(`[Twilio] 📞 start streamSid=${streamSid} callSid=${callSid}`);
 
       session = new CallSession(streamSid, ws);
-      sessions.set(streamSid, session);
-
       try {
         await session.start();
       } catch (e) {
         console.log(`[Session ${streamSid}] start error: ${e?.message || e}`);
-        session.close("start_error");
+        session?.close("session_start_error");
       }
-      return;
     }
 
-    if (msg.event === "media") {
-      if (!session) return;
-      session.fromTwilio(msg.media?.payload);
-      return;
-    }
+    if (m.event === "media") session?.fromTwilio(m.media.payload);
 
-    if (msg.event === "stop") {
+    if (m.event === "stop") {
       console.log("[Twilio] 📞 stop");
-      if (session) {
-        session.close("twilio_stop");
-        sessions.delete(session.streamSid);
-        session = null;
-      }
-      return;
-    }
-  });
-
-  ws.on("close", (code, reason) => {
-    console.log(`[Twilio] WS close code=${code} reason=${reason?.toString?.() || ""}`);
-    if (session) {
-      session.close("twilio_ws_close");
-      sessions.delete(session.streamSid);
+      session?.close("twilio_stop");
       session = null;
     }
   });
-
-  ws.on("error", () => {});
 });
 
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`   TwiML:  https://your-domain/twiml`);
   console.log(`   Health: https://your-domain/health`);
-
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
-    console.log("⚠️  Missing ELEVENLABS_API_KEY or ELEVENLABS_AGENT_ID");
-  }
-});
-
-process.on("SIGTERM", () => {
-  for (const s of sessions.values()) s.close("sigterm");
-  try { wss.close(); } catch {}
-  try { server.close(); } catch {}
 });
