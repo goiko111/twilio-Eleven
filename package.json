@@ -1,0 +1,16 @@
+{
+  "name": "twilio-elevenlabs-bridge",
+  "version": "1.0.0",
+  "description": "Real-time audio bridge between Twilio Media Streams and ElevenLabs Conversational AI",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
