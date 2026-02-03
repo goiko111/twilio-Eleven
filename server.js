@@ -44,7 +44,8 @@ const VAD_CONFIG = {
 const LOG_ENERGY_EVERY_N_FRAMES = 50; // Log energy every 50 frames (1s)
 
 // Agent speaking timeout - how long after last audio chunk to consider agent done
-const AGENT_AUDIO_TIMEOUT_MS = 600; // 600ms without audio = agent done speaking
+// Set to 1500ms to ensure Twilio queue has time to drain before allowing user input
+const AGENT_AUDIO_TIMEOUT_MS = 1500;
 
 // Audio Configuration
 const TWILIO_SAMPLE_RATE = 8000;
@@ -468,7 +469,12 @@ class ElevenLabsClient {
       case 'ping':
         const pingEventId = message.ping_event?.event_id || message.event_id;
         if (pingEventId) {
-          this.send({ type: 'pong', event_id: pingEventId });
+          // Pong requires type field according to ElevenLabs API
+          if (this.ws?.readyState === WebSocket.OPEN) {
+            const pongPayload = JSON.stringify({ type: 'pong', event_id: pingEventId });
+            console.log(`[ElevenLabs] 📤 Sending: ${pongPayload}`);
+            this.ws.send(pongPayload);
+          }
         }
         break;
 
@@ -490,18 +496,17 @@ class ElevenLabsClient {
     this.greetingTriggered = true;
     console.log('[ElevenLabs] 🚀 Triggering agent greeting...');
     
+    // Send a small silence chunk to trigger the agent
     const silence = generateSilence16k(100);
     const base64Silence = pcm16ToBase64(silence);
     
-    this.send({
-      type: 'user_audio_chunk',
-      user_audio_chunk: base64Silence
-    });
+    // ElevenLabs ConvAI expects just the user_audio_chunk field (no type wrapper)
+    this.ws.send(JSON.stringify({ user_audio_chunk: base64Silence }));
     
     this.turnCommitTime = Date.now();
-    this.send({
-      type: 'user_audio_commit'
-    });
+    
+    // user_audio_commit signals end of user turn
+    this.ws.send(JSON.stringify({ user_audio_commit: true }));
     
     console.log('[ElevenLabs] ✅ Greeting trigger sent');
   }
@@ -514,8 +519,9 @@ class ElevenLabsClient {
       return false;
     }
     
+    // IMPORTANT: ElevenLabs expects 'user_audio_chunk' with the audio in the same field
+    // The format must be base64-encoded PCM16 little-endian at 16kHz
     this.send({
-      type: 'user_audio_chunk',
       user_audio_chunk: base64Audio
     });
     return true;
@@ -534,15 +540,15 @@ class ElevenLabsClient {
     this.turnCommitTime = Date.now();
     console.log('[ElevenLabs] ⚡ User turn commit');
     
-    this.send({
-      type: 'user_audio_commit'
-    });
+    // ElevenLabs expects user_audio_commit without type wrapper
+    this.ws.send(JSON.stringify({ user_audio_commit: true }));
   }
 
   send(message) {
     if (this.ws?.readyState === WebSocket.OPEN) {
       const payload = JSON.stringify(message);
-      if (message.type !== 'user_audio_chunk' && message.type !== 'pong') {
+      // Log non-audio messages for debugging
+      if (!message.user_audio_chunk && message.type !== 'pong') {
         console.log(`[ElevenLabs] 📤 Sending: ${payload.substring(0, 150)}`);
       }
       this.ws.send(payload);
@@ -558,12 +564,21 @@ class ElevenLabsClient {
     
     this.agentAudioTimeout = setTimeout(() => {
       if (this.isAgentSpeaking) {
-        console.log('[ElevenLabs] ⏱️ Agent audio timeout - considering turn ended');
-        this.isAgentSpeaking = false;
-        this.hasReceivedAudio = false;
-        this.onAgentStateChange?.(false);
+        console.log('[ElevenLabs] ⏱️ Agent audio timeout - signaling turn may end soon');
+        // Don't immediately set speaking=false, let the CallSession check queue
+        this.pendingTurnEnd = true;
+        this.onAgentStateChange?.(false, true); // second param = pending (queue may still have data)
       }
     }, AGENT_AUDIO_TIMEOUT_MS);
+  }
+  
+  confirmTurnEnded() {
+    if (this.pendingTurnEnd) {
+      console.log('[ElevenLabs] ✅ Turn end confirmed (queue empty)');
+      this.isAgentSpeaking = false;
+      this.hasReceivedAudio = false;
+      this.pendingTurnEnd = false;
+    }
   }
 
   close() {
@@ -677,16 +692,51 @@ class CallSession {
     this.outQueue = Buffer.concat([this.outQueue, mulawBuffer]);
   }
 
-  handleAgentStateChange(isSpeaking) {
-    this.agentSpeaking = isSpeaking;
-    
+  handleAgentStateChange(isSpeaking, isPending = false) {
     if (isSpeaking) {
+      this.agentSpeaking = true;
       this.waitingForGreeting = false;
       console.log(`[Session ${this.streamSid}] Agent speaking - muting user audio processing`);
+    } else if (isPending) {
+      // Agent audio stopped but queue may still have data - start checking
+      this.startQueueDrainCheck();
     } else {
+      // Direct turn end (e.g., from turn_end event)
+      this.agentSpeaking = false;
       console.log(`[Session ${this.streamSid}] Agent finished - ready for user input`);
       this.vad.resetForNewTurn();
     }
+  }
+  
+  /**
+   * Check if Twilio queue has drained before marking agent as finished
+   */
+  startQueueDrainCheck() {
+    const checkInterval = setInterval(() => {
+      if (!this.isActive) {
+        clearInterval(checkInterval);
+        return;
+      }
+      
+      // Check if queue is nearly empty (less than 2 frames = 40ms)
+      if (this.outQueue.length < TWILIO_FRAME_SIZE * 2) {
+        clearInterval(checkInterval);
+        this.agentSpeaking = false;
+        this.elevenLabs?.confirmTurnEnded();
+        console.log(`[Session ${this.streamSid}] Agent finished (queue drained) - ready for user input`);
+        this.vad.resetForNewTurn();
+      }
+    }, 100); // Check every 100ms
+    
+    // Safety timeout - don't check forever
+    setTimeout(() => {
+      clearInterval(checkInterval);
+      if (this.agentSpeaking) {
+        this.agentSpeaking = false;
+        console.log(`[Session ${this.streamSid}] Agent finished (timeout) - ready for user input`);
+        this.vad.resetForNewTurn();
+      }
+    }, 5000);
   }
 
   processIncomingAudio(base64Mulaw) {
