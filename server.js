@@ -1,8 +1,13 @@
 /**
- * Twilio ↔ ElevenLabs Real-Time Audio Bridge
+ * Twilio ↔ ElevenLabs Real-Time Audio Bridge v3.0
  * 
  * This server acts as a bridge between Twilio Media Streams and ElevenLabs Conversational AI.
  * It handles audio transcoding, VAD-based turn detection, and bidirectional streaming.
+ * 
+ * Key features:
+ * - Frame-based audio playback to Twilio (20ms frames)
+ * - VAD with adaptive thresholds for telephony
+ * - Proper handling of agent/user turn-taking
  * 
  * Deploy on: Railway, Render, DigitalOcean, Heroku, or any Node.js host
  * 
@@ -23,21 +28,20 @@ const PORT = process.env.PORT || 8080;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
-// VAD Configuration - tuned for telephony
-// Based on actual measurements: noise floor ~0.0002-0.0003, speech ~0.08-0.17
+// VAD Configuration - tuned for telephony based on real measurements
+// Noise floor: ~0.0002-0.0003, Speech: ~0.08-0.17
 const VAD_CONFIG = {
-  silenceThresholdMs: 800,      // End turn after 800ms silence (was 420ms - too aggressive)
-  energyThreshold: 0.05,        // Slightly lower to catch softer speech (0.08 was cutting off speech)
+  silenceThresholdMs: 800,      // End turn after 800ms silence
+  energyThreshold: 0.02,        // Low threshold to catch soft speech (noise floor is ~0.0003)
   frameSize: 160,               // Samples per frame (20ms at 8kHz)
-  minSpeechFrames: 5,           // Minimum frames to confirm speech (100ms)
+  minSpeechFrames: 4,           // Minimum frames to confirm speech (80ms)
   maxSilenceBeforeGate: 500,    // Stop sending audio after 500ms silence (pre-commit)
-  interruptionThreshold: 0.15,  // Allow interruptions with clearer speech
-  minAudioChunksForCommit: 25,  // Require at least 25 audio chunks (~500ms of activity)
-  minSpeechDurationMs: 200,     // Minimum speech duration before allowing commit
+  interruptionThreshold: 0.08,  // Threshold for interrupting agent
+  minAudioChunksForCommit: 20,  // Require at least 20 audio chunks (~400ms of activity)
 };
 
 // Energy logging configuration
-const LOG_ENERGY_EVERY_N_FRAMES = 25; // Log energy every 25 frames (500ms)
+const LOG_ENERGY_EVERY_N_FRAMES = 50; // Log energy every 50 frames (1s)
 
 // Agent speaking timeout - how long after last audio chunk to consider agent done
 const AGENT_AUDIO_TIMEOUT_MS = 600; // 600ms without audio = agent done speaking
@@ -45,9 +49,11 @@ const AGENT_AUDIO_TIMEOUT_MS = 600; // 600ms without audio = agent done speaking
 // Audio Configuration
 const TWILIO_SAMPLE_RATE = 8000;
 const ELEVENLABS_SAMPLE_RATE = 16000;
+const TWILIO_FRAME_SIZE = 160; // 160 bytes = 20ms at 8kHz mu-law
 
 // Outbound call configuration
 const OUTBOUND_GREETING_DELAY_MS = 800; // Delay before triggering agent greeting
+const GREETING_TIMEOUT_MS = 2500; // Fallback timeout if greeting never arrives
 
 // ============================================================================
 // AUDIO UTILITIES
@@ -185,7 +191,7 @@ class SimpleVAD {
     this.isSpeaking = false;
     this.turnCommitted = false;
     this.audioGated = false;
-    this.audioChunksSent = 0; // Track how many chunks we've actually sent
+    this.audioChunksSent = 0;
     this.frameCount = 0;
     this.maxEnergy = 0;
     this.recentEnergies = [];
@@ -324,12 +330,12 @@ class ElevenLabsClient {
     this.isConnected = false;
     this.isSessionReady = false;
     this.reconnectAttempts = 0;
-    this.maxReconnects = 0; // Disable reconnects - they cause issues
+    this.maxReconnects = 0;
     this.isAgentSpeaking = false;
     this.hasReceivedAudio = false;
     this.turnCommitTime = null;
     this.greetingTriggered = false;
-    this.agentAudioTimeout = null; // Timeout to detect when agent stops speaking
+    this.agentAudioTimeout = null;
   }
 
   async connect() {
@@ -401,14 +407,13 @@ class ElevenLabsClient {
   }
 
   handleMessage(message) {
-    // Log ALL messages for debugging
+    // Log ALL messages for debugging (except pings)
     if (message.type !== 'ping') {
       console.log(`[ElevenLabs] 📨 Event type: ${message.type}`, JSON.stringify(message).substring(0, 200));
     }
     
     switch (message.type) {
       case 'audio':
-        // Try multiple possible audio formats
         const audioChunk = message.audio?.chunk || 
                           message.audio_event?.audio_base_64 ||
                           message.audio_event?.chunk ||
@@ -427,9 +432,7 @@ class ElevenLabsClient {
             this.onAgentStateChange?.(true);
           }
           
-          // Reset the audio timeout - agent is still speaking
           this.resetAgentAudioTimeout();
-          
           this.onAudio(audioChunk);
         } else {
           console.log('[ElevenLabs] ⚠️ Audio event but no chunk found:', JSON.stringify(message).substring(0, 300));
@@ -463,15 +466,9 @@ class ElevenLabsClient {
         break;
 
       case 'ping':
-        // Log full ping structure to understand format
-        console.log(`[ElevenLabs] 📨 Ping received:`, JSON.stringify(message));
-        // Extract event_id from the correct location
         const pingEventId = message.ping_event?.event_id || message.event_id;
         if (pingEventId) {
           this.send({ type: 'pong', event_id: pingEventId });
-        } else {
-          // If no event_id, just send pong without it - but log warning
-          console.log('[ElevenLabs] ⚠️ Ping has no event_id, skipping pong');
         }
         break;
 
@@ -485,10 +482,6 @@ class ElevenLabsClient {
     }
   }
 
-  /**
-   * Trigger the agent's first message by sending silence + commit
-   * This is needed for OUTBOUND calls where the agent should speak first
-   */
   triggerGreeting() {
     if (this.greetingTriggered || !this.isSessionReady) {
       return;
@@ -497,8 +490,7 @@ class ElevenLabsClient {
     this.greetingTriggered = true;
     console.log('[ElevenLabs] 🚀 Triggering agent greeting...');
     
-    // Send a small amount of silence
-    const silence = generateSilence16k(100); // 100ms of silence
+    const silence = generateSilence16k(100);
     const base64Silence = pcm16ToBase64(silence);
     
     this.send({
@@ -506,7 +498,6 @@ class ElevenLabsClient {
       user_audio_chunk: base64Silence
     });
     
-    // Immediately commit to trigger the agent's first message
     this.turnCommitTime = Date.now();
     this.send({
       type: 'user_audio_commit'
@@ -517,11 +508,9 @@ class ElevenLabsClient {
 
   sendAudio(base64Audio) {
     if (!this.isConnected) {
-      console.log('[ElevenLabs] ⚠️ Cannot send audio - not connected');
       return false;
     }
     if (!this.isSessionReady) {
-      console.log('[ElevenLabs] ⚠️ Cannot send audio - session not ready');
       return false;
     }
     
@@ -553,8 +542,7 @@ class ElevenLabsClient {
   send(message) {
     if (this.ws?.readyState === WebSocket.OPEN) {
       const payload = JSON.stringify(message);
-      // Log all outgoing messages (except audio chunks which are too large)
-      if (message.type !== 'user_audio_chunk') {
+      if (message.type !== 'user_audio_chunk' && message.type !== 'pong') {
         console.log(`[ElevenLabs] 📤 Sending: ${payload.substring(0, 150)}`);
       }
       this.ws.send(payload);
@@ -563,10 +551,6 @@ class ElevenLabsClient {
     }
   }
 
-  /**
-   * Reset/start the agent audio timeout
-   * If no audio received for AGENT_AUDIO_TIMEOUT_MS, consider agent done speaking
-   */
   resetAgentAudioTimeout() {
     if (this.agentAudioTimeout) {
       clearTimeout(this.agentAudioTimeout);
@@ -604,8 +588,14 @@ class CallSession {
     this.isActive = true;
     this.agentSpeaking = false;
     this.audioSentCount = 0;
-    this.waitingForGreeting = true; // Don't process user audio until agent speaks first
+    this.waitingForGreeting = true;
     this.greetingTimeout = null;
+    this.greetingFallbackTimeout = null;
+    
+    // Output queue for Twilio audio playback (20ms frames)
+    this.outQueue = Buffer.alloc(0);
+    this.playInterval = null;
+    this.framesSent = 0;
     
     console.log(`[Session ${streamSid}] Created`);
   }
@@ -623,6 +613,9 @@ class CallSession {
       await this.elevenLabs.connect();
       console.log(`[Session ${this.streamSid}] ElevenLabs connected`);
 
+      // Start the Twilio audio player
+      this.startTwilioPlayer();
+
       // For outbound calls: trigger the greeting after a short delay
       this.greetingTimeout = setTimeout(() => {
         if (this.isActive && this.elevenLabs?.isSessionReady) {
@@ -630,18 +623,65 @@ class CallSession {
         }
       }, OUTBOUND_GREETING_DELAY_MS);
 
+      // Fallback: if greeting never arrives, enable user audio anyway
+      this.greetingFallbackTimeout = setTimeout(() => {
+        if (this.waitingForGreeting) {
+          console.log(`[Session ${this.streamSid}] ⚠️ Greeting timeout, enabling user audio anyway`);
+          this.waitingForGreeting = false;
+        }
+      }, GREETING_TIMEOUT_MS);
+
     } catch (error) {
       console.error(`[Session ${this.streamSid}] Failed to start:`, error);
       this.close();
     }
   }
 
+  /**
+   * Start the Twilio audio player interval
+   * Sends 160 bytes (20ms) of mu-law audio every 20ms
+   */
+  startTwilioPlayer() {
+    if (this.playInterval) return;
+
+    this.playInterval = setInterval(() => {
+      if (!this.isActive) return;
+      if (this.twilioWs.readyState !== WebSocket.OPEN) return;
+      if (this.outQueue.length < TWILIO_FRAME_SIZE) return;
+
+      const frame = this.outQueue.subarray(0, TWILIO_FRAME_SIZE);
+      this.outQueue = this.outQueue.subarray(TWILIO_FRAME_SIZE);
+
+      const message = {
+        event: 'media',
+        streamSid: this.streamSid,
+        media: { payload: frame.toString('base64') }
+      };
+
+      this.twilioWs.send(JSON.stringify(message));
+      this.framesSent++;
+
+      // Log periodically (every ~1 second = 50 frames)
+      if (this.framesSent % 50 === 0) {
+        console.log(`[Twilio ${this.streamSid.substring(0, 8)}] ▶️ Playing... frames=${this.framesSent}, queue=${this.outQueue.length} bytes`);
+      }
+    }, 20);
+
+    console.log(`[Session ${this.streamSid}] Twilio player started`);
+  }
+
+  /**
+   * Enqueue audio data for playback to Twilio
+   */
+  enqueueToTwilio(mulawBuffer) {
+    this.outQueue = Buffer.concat([this.outQueue, mulawBuffer]);
+  }
+
   handleAgentStateChange(isSpeaking) {
     this.agentSpeaking = isSpeaking;
     
     if (isSpeaking) {
-      // Agent started speaking - don't process user audio
-      this.waitingForGreeting = false; // First message received
+      this.waitingForGreeting = false;
       console.log(`[Session ${this.streamSid}] Agent speaking - muting user audio processing`);
     } else {
       console.log(`[Session ${this.streamSid}] Agent finished - ready for user input`);
@@ -665,16 +705,13 @@ class CallSession {
       // Calculate energy for logging
       const energy = this.vad.calculateEnergy(pcm8k);
       
-      // While agent is speaking, only allow very loud interruptions
+      // While agent is speaking, only allow clear interruptions
       if (this.agentSpeaking) {
-        // Only allow interruption with VERY clear speech (0.25 is quite loud)
         if (energy > VAD_CONFIG.interruptionThreshold) {
           console.log(`[Session ${this.streamSid}] 🛑 User interruption (energy: ${energy.toFixed(3)})`);
           const pcm16k = upsample8to16(pcm8k);
           const base64Pcm = pcm16ToBase64(pcm16k);
           this.elevenLabs.sendAudio(base64Pcm);
-          // DON'T send commit here - let ElevenLabs handle the interruption
-          // The interruption event from ElevenLabs will reset our state
         }
         return;
       }
@@ -695,17 +732,16 @@ class CallSession {
           this.audioSentCount++;
           this.vad.incrementAudioChunks();
           if (this.audioSentCount % 100 === 0) {
-            console.log(`[Session ${this.streamSid}] Sent ${this.audioSentCount} audio chunks`);
+            console.log(`[Session ${this.streamSid}] Sent ${this.audioSentCount} audio chunks to ElevenLabs`);
           }
         }
       }
 
       if (vadResult.turnEnded) {
-        // Only commit if we have enough audio to be considered real speech
         if (this.vad.hasEnoughAudioForCommit()) {
           console.log(`[Session ${this.streamSid}] ⚡ User turn ended (${vadResult.silenceMs}ms silence, ${this.vad.audioChunksSent} chunks)`);
           this.elevenLabs.endTurn();
-          this.agentSpeaking = true; // Expect agent to respond
+          this.agentSpeaking = true;
         } else {
           console.log(`[Session ${this.streamSid}] 🔇 Turn ended but not enough audio (${this.vad.audioChunksSent} chunks) - ignoring`);
           this.vad.resetForNewTurn();
@@ -725,7 +761,8 @@ class CallSession {
       const pcm8k = downsample16to8(pcm16k);
       const mulawBuffer = encodeMulaw(pcm8k);
       
-      this.sendToTwilio(mulawBuffer.toString('base64'));
+      // Enqueue for frame-based playback instead of sending directly
+      this.enqueueToTwilio(mulawBuffer);
 
     } catch (error) {
       console.error(`[Session ${this.streamSid}] Audio transcode error:`, error);
@@ -736,26 +773,20 @@ class CallSession {
     console.error(`[Session ${this.streamSid}] ElevenLabs error:`, error);
   }
 
-  sendToTwilio(base64Mulaw) {
-    if (this.twilioWs.readyState !== WebSocket.OPEN) return;
-
-    const message = {
-      event: 'media',
-      streamSid: this.streamSid,
-      media: {
-        payload: base64Mulaw
-      }
-    };
-
-    this.twilioWs.send(JSON.stringify(message));
-  }
-
   close() {
-    console.log(`[Session ${this.streamSid}] Closing - sent ${this.audioSentCount} user audio chunks`);
+    console.log(`[Session ${this.streamSid}] Closing - sent ${this.audioSentCount} user audio chunks, played ${this.framesSent} frames to Twilio`);
     this.isActive = false;
+    
     if (this.greetingTimeout) {
       clearTimeout(this.greetingTimeout);
     }
+    if (this.greetingFallbackTimeout) {
+      clearTimeout(this.greetingFallbackTimeout);
+    }
+    if (this.playInterval) {
+      clearInterval(this.playInterval);
+    }
+    
     this.elevenLabs?.close();
   }
 }
@@ -867,7 +898,7 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, () => {
   console.log(`
 ╔════════════════════════════════════════════════════════════════╗
-║  Twilio ↔ ElevenLabs Audio Bridge v2.0                         ║
+║  Twilio ↔ ElevenLabs Audio Bridge v3.0                         ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  Server running on port ${PORT}                                    ║
 ║                                                                ║
