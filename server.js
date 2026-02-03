@@ -1,5 +1,8 @@
 /**
- * Twilio ↔ ElevenLabs Real-Time Audio Bridge (STABLE + AUTO-COMMIT)
+ * Twilio ↔ ElevenLabs Real-Time Audio Bridge (v3.2 STABLE)
+ * - Prevent commits after close
+ * - Logs close reasons/errors
+ * - Sends comfort-silence frames to Twilio to avoid early hangups
  * Node 18+
  */
 
@@ -88,12 +91,17 @@ function rmsEnergy(samples) {
   return Math.sqrt(sum / samples.length);
 }
 
+/* 20ms silence frame in μ-law: use 0xFF (common μ-law “silence”) */
+const TWILIO_FRAME_BYTES = 160;
+const MULAW_SILENCE_FRAME = Buffer.alloc(TWILIO_FRAME_BYTES, 0xff);
+
 /* ───────────────────── ELEVENLABS CLIENT ───────────────────── */
 
 class ElevenLabs {
-  constructor(onAudio) {
+  constructor(onAudio, onLog) {
     this.ws = null;
     this.onAudio = onAudio;
+    this.onLog = onLog;
     this.ready = false;
   }
 
@@ -110,11 +118,31 @@ class ElevenLabs {
     const { signed_url } = await r.json();
     this.ws = new WebSocket(signed_url);
 
+    this.ws.on("open", () => {
+      this.onLog?.("[ElevenLabs] WS open");
+    });
+
+    this.ws.on("close", (code, reason) => {
+      this.onLog?.(`[ElevenLabs] WS close code=${code} reason=${reason?.toString?.() || ""}`);
+      this.ready = false;
+    });
+
+    this.ws.on("error", (err) => {
+      this.onLog?.(`[ElevenLabs] WS error: ${err?.message || err}`);
+    });
+
     this.ws.on("message", (d) => {
-      const m = JSON.parse(d.toString());
+      let m;
+      try {
+        m = JSON.parse(d.toString());
+      } catch (e) {
+        this.onLog?.("[ElevenLabs] Bad JSON message");
+        return;
+      }
 
       if (m.type === "conversation_initiation_metadata") {
         this.ready = true;
+        this.onLog?.("[ElevenLabs] ✅ ready");
       }
 
       if (m.type === "audio" && m.audio_event?.audio_base_64) {
@@ -122,7 +150,9 @@ class ElevenLabs {
       }
 
       if (m.type === "ping") {
-        this.ws.send(JSON.stringify({ type: "pong", event_id: m.ping_event.event_id }));
+        try {
+          this.ws.send(JSON.stringify({ type: "pong", event_id: m.ping_event.event_id }));
+        } catch {}
       }
     });
 
@@ -134,13 +164,19 @@ class ElevenLabs {
 
   sendAudio(b64) {
     if (!this.ready) return;
-    this.ws.send(JSON.stringify({ user_audio_chunk: b64 }));
+    try {
+      this.ws.send(JSON.stringify({ user_audio_chunk: b64 }));
+    } catch {}
   }
 
   commit() {
     if (!this.ready) return;
-    this.ws.send(JSON.stringify({ type: "user_audio_commit" }));
-    this.ws.send(JSON.stringify({ user_audio_commit: true }));
+    try {
+      this.ws.send(JSON.stringify({ type: "user_audio_commit" }));
+    } catch {}
+    try {
+      this.ws.send(JSON.stringify({ user_audio_commit: true }));
+    } catch {}
   }
 
   triggerGreeting() {
@@ -159,6 +195,8 @@ class CallSession {
     this.streamSid = streamSid;
     this.twilioWs = twilioWs;
 
+    this.isActive = true;
+
     this.eleven = null;
 
     this.outBuf = Buffer.alloc(0);
@@ -171,6 +209,9 @@ class CallSession {
     this.MIN_AUDIO_BEFORE_COMMIT_MS = 250;
     this.userSpeechStartAt = null;
 
+    this.framesSent = 0;
+    this.lastTwilioSendAt = Date.now();
+
     this.player = setInterval(() => this.playFrame(), 20);
     this.commitTimer = setInterval(() => this.maybeCommit(), 100);
 
@@ -178,44 +219,74 @@ class CallSession {
   }
 
   async start() {
-    this.eleven = new ElevenLabs((b64) => this.fromEleven(b64));
+    this.eleven = new ElevenLabs(
+      (b64) => this.fromEleven(b64),
+      (msg) => console.log(`[Session ${this.streamSid}] ${msg}`)
+    );
     await this.eleven.connect();
+    if (!this.isActive) return;
     console.log(`[Session ${this.streamSid}] ElevenLabs connected`);
     this.eleven.triggerGreeting();
   }
 
   playFrame() {
+    if (!this.isActive) return;
     if (this.twilioWs.readyState !== WebSocket.OPEN) return;
-    if (this.outBuf.length < 160) return;
 
-    const frame = this.outBuf.subarray(0, 160);
-    this.outBuf = this.outBuf.subarray(160);
+    // If we have audio, send it. Otherwise, send silence to keep Twilio alive.
+    let frame;
+    if (this.outBuf.length >= TWILIO_FRAME_BYTES) {
+      frame = this.outBuf.subarray(0, TWILIO_FRAME_BYTES);
+      this.outBuf = this.outBuf.subarray(TWILIO_FRAME_BYTES);
+    } else {
+      frame = MULAW_SILENCE_FRAME;
+    }
 
-    this.twilioWs.send(JSON.stringify({
-      event: "media",
-      streamSid: this.streamSid,
-      media: { payload: frame.toString("base64") }
-    }));
+    try {
+      this.twilioWs.send(JSON.stringify({
+        event: "media",
+        streamSid: this.streamSid,
+        media: { payload: frame.toString("base64") }
+      }));
+      this.framesSent++;
+      this.lastTwilioSendAt = Date.now();
+
+      if (this.framesSent % 50 === 0) {
+        console.log(`[Twilio ${this.streamSid.slice(0, 8)}] ▶️ frames=${this.framesSent} queue=${this.outBuf.length}`);
+      }
+    } catch (e) {
+      console.log(`[Session ${this.streamSid}] Twilio send error -> closing: ${e?.message || e}`);
+      this.close("twilio_send_error");
+    }
   }
 
   fromTwilio(b64) {
-    const pcm8 = decodeMulaw(Buffer.from(b64, "base64"));
-    const e = rmsEnergy(pcm8);
+    if (!this.isActive) return;
+    if (!this.eleven) return;
 
-    const now = Date.now();
-    if (e > this.ENERGY_THRESHOLD) {
-      this.lastVoiceAt = now;
-      if (!this.userTalking) {
-        this.userTalking = true;
-        this.userSpeechStartAt = now;
+    try {
+      const pcm8 = decodeMulaw(Buffer.from(b64, "base64"));
+      const e = rmsEnergy(pcm8);
+
+      const now = Date.now();
+      if (e > this.ENERGY_THRESHOLD) {
+        this.lastVoiceAt = now;
+        if (!this.userTalking) {
+          this.userTalking = true;
+          this.userSpeechStartAt = now;
+        }
       }
-    }
 
-    const pcm16 = upsample8to16(pcm8);
-    this.eleven.sendAudio(pcm16ToBase64(pcm16));
+      const pcm16 = upsample8to16(pcm8);
+      this.eleven.sendAudio(pcm16ToBase64(pcm16));
+    } catch (err) {
+      console.log(`[Session ${this.streamSid}] fromTwilio error -> closing: ${err?.message || err}`);
+      this.close("from_twilio_error");
+    }
   }
 
   maybeCommit() {
+    if (!this.isActive) return;
     if (!this.userTalking) return;
 
     const now = Date.now();
@@ -226,22 +297,34 @@ class CallSession {
       console.log(`[Session ${this.streamSid}] ⚡ Auto-commit (silence ${silentFor}ms, spoke ${spokeFor}ms)`);
       this.userTalking = false;
       this.userSpeechStartAt = null;
-      this.eleven.commit();
+      this.eleven?.commit();
     }
   }
 
   fromEleven(b64) {
-    const pcm16 = base64ToPcm16(b64);
-    const pcm8 = downsample16to8(pcm16);
-    const mulaw = encodeMulaw(pcm8);
-    this.outBuf = Buffer.concat([this.outBuf, mulaw]);
+    if (!this.isActive) return;
+    try {
+      const pcm16 = base64ToPcm16(b64);
+      const pcm8 = downsample16to8(pcm16);
+      const mulaw = encodeMulaw(pcm8);
+
+      // ✅ IMPORTANT: correct concat
+      this.outBuf = Buffer.concat([this.outBuf, mulaw]);
+    } catch (err) {
+      console.log(`[Session ${this.streamSid}] fromEleven error -> closing: ${err?.message || err}`);
+      this.close("from_eleven_error");
+    }
   }
 
-  close() {
-    console.log(`[Session ${this.streamSid}] Closing`);
+  close(reason = "unknown") {
+    if (!this.isActive) return;
+    this.isActive = false;
+    console.log(`[Session ${this.streamSid}] Closing reason=${reason}`);
+
     clearInterval(this.player);
     clearInterval(this.commitTimer);
-    this.eleven?.close();
+
+    try { this.eleven?.close(); } catch {}
   }
 }
 
@@ -272,10 +355,29 @@ const wss = new WebSocket.Server({ server });
 
 wss.on("connection", (ws, req) => {
   console.log(`[Server] New WebSocket connection from ${req.url}`);
+
   let session = null;
 
+  ws.on("close", (code, reason) => {
+    console.log(`[Twilio] WS close code=${code} reason=${reason?.toString?.() || ""}`);
+    session?.close("twilio_ws_close");
+    session = null;
+  });
+
+  ws.on("error", (err) => {
+    console.log(`[Twilio] WS error: ${err?.message || err}`);
+    session?.close("twilio_ws_error");
+    session = null;
+  });
+
   ws.on("message", async (d) => {
-    const m = JSON.parse(d.toString());
+    let m;
+    try {
+      m = JSON.parse(d.toString());
+    } catch {
+      console.log("[Twilio] Bad JSON message");
+      return;
+    }
 
     if (m.event === "connected") {
       console.log("[Twilio] Connected");
@@ -285,7 +387,12 @@ wss.on("connection", (ws, req) => {
       const { streamSid, callSid } = m.start;
       console.log(`[Twilio] 📞 start streamSid=${streamSid} callSid=${callSid}`);
       session = new CallSession(streamSid, ws);
-      await session.start();
+      try {
+        await session.start();
+      } catch (e) {
+        console.log(`[Twilio] session.start error: ${e?.message || e}`);
+        session?.close("session_start_error");
+      }
     }
 
     if (m.event === "media") {
@@ -294,14 +401,9 @@ wss.on("connection", (ws, req) => {
 
     if (m.event === "stop") {
       console.log("[Twilio] 📞 stop");
-      session?.close();
+      session?.close("twilio_stop");
       session = null;
     }
-  });
-
-  ws.on("close", () => {
-    session?.close();
-    session = null;
   });
 });
 
