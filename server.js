@@ -33,6 +33,9 @@ const VAD_CONFIG = {
   interruptionThreshold: 0.25,  // VERY high threshold - only clear speech interrupts
 };
 
+// Agent speaking timeout - how long after last audio chunk to consider agent done
+const AGENT_AUDIO_TIMEOUT_MS = 600; // 600ms without audio = agent done speaking
+
 // Audio Configuration
 const TWILIO_SAMPLE_RATE = 8000;
 const ELEVENLABS_SAMPLE_RATE = 16000;
@@ -287,7 +290,7 @@ class ElevenLabsClient {
     this.hasReceivedAudio = false;
     this.turnCommitTime = null;
     this.greetingTriggered = false;
-  }
+    this.agentAudioTimeout = null; // Timeout to detect when agent stops speaking
 
   async connect() {
     return new Promise(async (resolve, reject) => {
@@ -383,6 +386,10 @@ class ElevenLabsClient {
             console.log('[ElevenLabs] 🎙️ Agent started speaking');
             this.onAgentStateChange?.(true);
           }
+          
+          // Reset the audio timeout - agent is still speaking
+          this.resetAgentAudioTimeout();
+          
           this.onAudio(audioChunk);
         } else {
           console.log('[ElevenLabs] ⚠️ Audio event but no chunk found:', JSON.stringify(message).substring(0, 300));
@@ -527,8 +534,30 @@ class ElevenLabsClient {
     }
   }
 
+  /**
+   * Reset/start the agent audio timeout
+   * If no audio received for AGENT_AUDIO_TIMEOUT_MS, consider agent done speaking
+   */
+  resetAgentAudioTimeout() {
+    if (this.agentAudioTimeout) {
+      clearTimeout(this.agentAudioTimeout);
+    }
+    
+    this.agentAudioTimeout = setTimeout(() => {
+      if (this.isAgentSpeaking) {
+        console.log('[ElevenLabs] ⏱️ Agent audio timeout - considering turn ended');
+        this.isAgentSpeaking = false;
+        this.hasReceivedAudio = false;
+        this.onAgentStateChange?.(false);
+      }
+    }, AGENT_AUDIO_TIMEOUT_MS);
+  }
+
   close() {
     this.maxReconnects = 0;
+    if (this.agentAudioTimeout) {
+      clearTimeout(this.agentAudioTimeout);
+    }
     this.ws?.close();
   }
 }
