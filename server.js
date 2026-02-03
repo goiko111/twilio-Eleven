@@ -26,13 +26,16 @@ const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 // VAD Configuration - tuned for telephony
 const VAD_CONFIG = {
   silenceThresholdMs: 420,      // End turn after 420ms silence
-  energyThreshold: 0.04,        // Higher threshold to filter telephony noise
+  energyThreshold: 0.08,        // Much higher threshold - telephony noise floor is ~0.04-0.06
   frameSize: 160,               // Samples per frame (20ms at 8kHz)
-  minSpeechFrames: 6,           // Minimum frames to confirm speech (120ms) - more robust
+  minSpeechFrames: 8,           // Minimum frames to confirm speech (160ms) - more robust
   maxSilenceBeforeGate: 300,    // Stop sending audio after 300ms silence (pre-commit)
   interruptionThreshold: 0.25,  // VERY high threshold - only clear speech interrupts
-  minAudioChunksForCommit: 10,  // Require at least 10 audio chunks before allowing commit
+  minAudioChunksForCommit: 15,  // Require at least 15 audio chunks before allowing commit
 };
+
+// Energy logging configuration
+const LOG_ENERGY_EVERY_N_FRAMES = 25; // Log energy every 25 frames (500ms)
 
 // Agent speaking timeout - how long after last audio chunk to consider agent done
 const AGENT_AUDIO_TIMEOUT_MS = 600; // 600ms without audio = agent done speaking
@@ -181,6 +184,9 @@ class SimpleVAD {
     this.turnCommitted = false;
     this.audioGated = false;
     this.audioChunksSent = 0; // Track how many chunks we've actually sent
+    this.frameCount = 0;
+    this.maxEnergy = 0;
+    this.recentEnergies = [];
   }
 
   /**
@@ -198,7 +204,9 @@ class SimpleVAD {
   /**
    * Process audio frame and return turn detection result
    */
-  processFrame(samples) {
+  processFrame(samples, sessionId = '') {
+    this.frameCount++;
+    
     if (this.turnCommitted) {
       return {
         isSpeech: false,
@@ -209,6 +217,18 @@ class SimpleVAD {
     }
 
     const energy = this.calculateEnergy(samples);
+    
+    // Track energy for debugging
+    this.recentEnergies.push(energy);
+    if (this.recentEnergies.length > 10) this.recentEnergies.shift();
+    if (energy > this.maxEnergy) this.maxEnergy = energy;
+    
+    // Log energy periodically for debugging
+    if (this.frameCount % LOG_ENERGY_EVERY_N_FRAMES === 0) {
+      const avgEnergy = this.recentEnergies.reduce((a, b) => a + b, 0) / this.recentEnergies.length;
+      console.log(`[VAD ${sessionId}] 📊 Energy: current=${energy.toFixed(4)}, avg=${avgEnergy.toFixed(4)}, max=${this.maxEnergy.toFixed(4)}, threshold=${this.config.energyThreshold}, speaking=${this.isSpeaking}`);
+    }
+    
     const isSpeech = energy > this.config.energyThreshold;
     
     if (isSpeech) {
@@ -217,6 +237,9 @@ class SimpleVAD {
       this.audioGated = false;
       
       if (this.speechFrames >= this.config.minSpeechFrames) {
+        if (!this.isSpeaking) {
+          console.log(`[VAD ${sessionId}] 🎤 Speech started (energy: ${energy.toFixed(4)})`);
+        }
         this.isSpeaking = true;
       }
       
@@ -270,6 +293,9 @@ class SimpleVAD {
     this.turnCommitted = false;
     this.audioGated = false;
     this.audioChunksSent = 0;
+    this.frameCount = 0;
+    this.maxEnergy = 0;
+    this.recentEnergies = [];
   }
 
   incrementAudioChunks() {
@@ -652,7 +678,7 @@ class CallSession {
       }
       
       // Normal VAD processing when agent is not speaking
-      const vadResult = this.vad.processFrame(pcm8k);
+      const vadResult = this.vad.processFrame(pcm8k, this.streamSid.substring(0, 8));
       
       if (vadResult.isSpeech && this.vad.turnCommitted) {
         console.log(`[Session ${this.streamSid}] New speech detected - resetting VAD`);
