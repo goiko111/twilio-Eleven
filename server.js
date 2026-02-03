@@ -23,19 +23,22 @@ const PORT = process.env.PORT || 8080;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
-// VAD Configuration - AGGRESSIVE turn detection for fast response
+// VAD Configuration - tuned for telephony
 const VAD_CONFIG = {
-  silenceThresholdMs: 420,      // End turn after 420ms silence - no waiting!
-  energyThreshold: 0.015,       // Higher threshold for telephony noise floor
+  silenceThresholdMs: 500,      // End turn after 500ms silence
+  energyThreshold: 0.02,        // Higher threshold for telephony noise floor
   frameSize: 160,               // Samples per frame (20ms at 8kHz)
-  minSpeechFrames: 3,           // Minimum frames to confirm speech (60ms)
-  maxSilenceBeforeGate: 300,    // Stop sending audio after 300ms silence (pre-commit)
-  interruptionThreshold: 0.05,  // Much higher threshold for interruption detection
+  minSpeechFrames: 4,           // Minimum frames to confirm speech (80ms)
+  maxSilenceBeforeGate: 350,    // Stop sending audio after 350ms silence (pre-commit)
+  interruptionThreshold: 0.08,  // Very high threshold for interruption detection
 };
 
 // Audio Configuration
 const TWILIO_SAMPLE_RATE = 8000;
 const ELEVENLABS_SAMPLE_RATE = 16000;
+
+// Outbound call configuration
+const OUTBOUND_GREETING_DELAY_MS = 800; // Delay before triggering agent greeting
 
 // ============================================================================
 // AUDIO UTILITIES
@@ -147,6 +150,14 @@ function base64ToPcm16(base64) {
     samples[i] = buffer.readInt16LE(i * 2);
   }
   return samples;
+}
+
+/**
+ * Generate silence buffer (16kHz PCM16)
+ */
+function generateSilence16k(durationMs) {
+  const numSamples = Math.floor((durationMs / 1000) * ELEVENLABS_SAMPLE_RATE);
+  return new Int16Array(numSamples); // All zeros = silence
 }
 
 // ============================================================================
@@ -269,12 +280,13 @@ class ElevenLabsClient {
     this.onAgentStateChange = onAgentStateChange;
     this.ws = null;
     this.isConnected = false;
-    this.isSessionReady = false;  // NEW: Track if session is fully established
+    this.isSessionReady = false;
     this.reconnectAttempts = 0;
-    this.maxReconnects = 3;
+    this.maxReconnects = 0; // Disable reconnects - they cause issues
     this.isAgentSpeaking = false;
-    this.hasReceivedAudio = false;  // NEW: Track if agent has started sending audio
+    this.hasReceivedAudio = false;
     this.turnCommitTime = null;
+    this.greetingTriggered = false;
   }
 
   async connect() {
@@ -301,7 +313,6 @@ class ElevenLabsClient {
           console.log('[ElevenLabs] WebSocket connected');
           this.isConnected = true;
           this.reconnectAttempts = 0;
-          // Don't resolve yet - wait for conversation_initiation_metadata
         });
 
         this.ws.on('message', (data) => {
@@ -309,10 +320,9 @@ class ElevenLabsClient {
             const message = JSON.parse(data.toString());
             this.handleMessage(message);
             
-            // Resolve promise when session is ready
             if (message.type === 'conversation_initiation_metadata' && !this.isSessionReady) {
               this.isSessionReady = true;
-              console.log('[ElevenLabs] Session fully established - ready to receive audio');
+              console.log('[ElevenLabs] ✅ Session ready');
               resolve();
             }
           } catch (e) {
@@ -325,12 +335,6 @@ class ElevenLabsClient {
           this.isConnected = false;
           this.isSessionReady = false;
           this.hasReceivedAudio = false;
-          
-          if (this.reconnectAttempts < this.maxReconnects) {
-            this.reconnectAttempts++;
-            console.log(`[ElevenLabs] Attempting reconnect ${this.reconnectAttempts}/${this.maxReconnects}`);
-            setTimeout(() => this.connect(), 500);
-          }
         });
 
         this.ws.on('error', (error) => {
@@ -339,10 +343,9 @@ class ElevenLabsClient {
           reject(error);
         });
 
-        // Timeout for initial connection
         setTimeout(() => {
           if (!this.isSessionReady) {
-            console.log('[ElevenLabs] Connection timeout - resolving anyway');
+            console.log('[ElevenLabs] Connection timeout');
             resolve();
           }
         }, 5000);
@@ -358,15 +361,15 @@ class ElevenLabsClient {
     switch (message.type) {
       case 'audio':
         if (message.audio?.chunk) {
-          // Mark that we've received audio - now interruption is valid
           if (!this.hasReceivedAudio) {
             this.hasReceivedAudio = true;
             const latency = this.turnCommitTime ? Date.now() - this.turnCommitTime : 0;
-            console.log(`[ElevenLabs] ⚡ First audio received (latency: ${latency}ms)`);
+            console.log(`[ElevenLabs] 🔊 First audio chunk received (latency: ${latency}ms)`);
           }
           
           if (!this.isAgentSpeaking) {
             this.isAgentSpeaking = true;
+            console.log('[ElevenLabs] 🎙️ Agent started speaking');
             this.onAgentStateChange?.(true);
           }
           this.onAudio(message.audio.chunk);
@@ -374,8 +377,7 @@ class ElevenLabsClient {
         break;
 
       case 'agent_response':
-        console.log('[ElevenLabs] Agent response:', message.agent_response_event?.agent_response?.substring(0, 50));
-        // Don't set speaking flag here - wait for actual audio
+        console.log('[ElevenLabs] 💬 Agent text:', message.agent_response_event?.agent_response?.substring(0, 60));
         break;
 
       case 'agent_response_correction':
@@ -383,11 +385,11 @@ class ElevenLabsClient {
         break;
 
       case 'user_transcript':
-        console.log('[ElevenLabs] User transcript:', message.user_transcription_event?.user_transcript);
+        console.log('[ElevenLabs] 👤 User said:', message.user_transcription_event?.user_transcript);
         break;
 
       case 'interruption':
-        console.log('[ElevenLabs] Interrupted - stopping agent audio');
+        console.log('[ElevenLabs] ⚠️ Interruption event');
         this.isAgentSpeaking = false;
         this.hasReceivedAudio = false;
         this.onAgentStateChange?.(false);
@@ -417,9 +419,35 @@ class ElevenLabsClient {
   }
 
   /**
-   * Send audio chunk to ElevenLabs
-   * ONLY call this when session is ready
+   * Trigger the agent's first message by sending silence + commit
+   * This is needed for OUTBOUND calls where the agent should speak first
    */
+  triggerGreeting() {
+    if (this.greetingTriggered || !this.isSessionReady) {
+      return;
+    }
+    
+    this.greetingTriggered = true;
+    console.log('[ElevenLabs] 🚀 Triggering agent greeting...');
+    
+    // Send a small amount of silence
+    const silence = generateSilence16k(100); // 100ms of silence
+    const base64Silence = pcm16ToBase64(silence);
+    
+    this.send({
+      type: 'user_audio_chunk',
+      user_audio_chunk: base64Silence
+    });
+    
+    // Immediately commit to trigger the agent's first message
+    this.turnCommitTime = Date.now();
+    this.send({
+      type: 'user_audio_commit'
+    });
+    
+    console.log('[ElevenLabs] ✅ Greeting trigger sent');
+  }
+
   sendAudio(base64Audio) {
     if (!this.isConnected || !this.isSessionReady) {
       return false;
@@ -432,9 +460,6 @@ class ElevenLabsClient {
     return true;
   }
 
-  /**
-   * Check if agent is actually playing audio (not just preparing)
-   */
   isPlayingAudio() {
     return this.isAgentSpeaking && this.hasReceivedAudio;
   }
@@ -443,7 +468,7 @@ class ElevenLabsClient {
     if (!this.isConnected || !this.isSessionReady) return;
     
     this.turnCommitTime = Date.now();
-    console.log('[ElevenLabs] ⚡ Sending user_audio_commit');
+    console.log('[ElevenLabs] ⚡ User turn commit');
     
     this.send({
       type: 'user_audio_commit'
@@ -474,7 +499,9 @@ class CallSession {
     this.vad = new SimpleVAD();
     this.isActive = true;
     this.agentSpeaking = false;
-    this.audioSentCount = 0;  // Track how many audio chunks sent
+    this.audioSentCount = 0;
+    this.waitingForGreeting = true; // Don't process user audio until agent speaks first
+    this.greetingTimeout = null;
     
     console.log(`[Session ${streamSid}] Created`);
   }
@@ -490,7 +517,14 @@ class CallSession {
       );
 
       await this.elevenLabs.connect();
-      console.log(`[Session ${this.streamSid}] ElevenLabs connected - ready for conversation`);
+      console.log(`[Session ${this.streamSid}] ElevenLabs connected`);
+
+      // For outbound calls: trigger the greeting after a short delay
+      this.greetingTimeout = setTimeout(() => {
+        if (this.isActive && this.elevenLabs?.isSessionReady) {
+          this.elevenLabs.triggerGreeting();
+        }
+      }, OUTBOUND_GREETING_DELAY_MS);
 
     } catch (error) {
       console.error(`[Session ${this.streamSid}] Failed to start:`, error);
@@ -500,33 +534,42 @@ class CallSession {
 
   handleAgentStateChange(isSpeaking) {
     this.agentSpeaking = isSpeaking;
-    if (!isSpeaking) {
-      console.log(`[Session ${this.streamSid}] Agent finished - ready for user`);
+    
+    if (isSpeaking) {
+      // Agent started speaking - don't process user audio
+      this.waitingForGreeting = false; // First message received
+      console.log(`[Session ${this.streamSid}] Agent speaking - muting user audio processing`);
+    } else {
+      console.log(`[Session ${this.streamSid}] Agent finished - ready for user input`);
       this.vad.resetForNewTurn();
     }
   }
 
-  /**
-   * Process incoming Twilio audio
-   */
   processIncomingAudio(base64Mulaw) {
     if (!this.isActive || !this.elevenLabs?.isConnected) return;
-    if (!this.elevenLabs?.isSessionReady) return;  // Don't send until session ready
+    if (!this.elevenLabs?.isSessionReady) return;
 
     try {
       const mulawBuffer = Buffer.from(base64Mulaw, 'base64');
       const pcm8k = decodeMulaw(mulawBuffer);
       
-      // While agent is ACTUALLY playing audio, check for loud interruption only
-      if (this.elevenLabs.isPlayingAudio()) {
+      // If we're still waiting for the greeting, don't process audio
+      if (this.waitingForGreeting) {
+        return;
+      }
+      
+      // While agent is speaking, only check for very loud interruptions
+      if (this.agentSpeaking) {
         const energy = this.vad.calculateEnergy(pcm8k);
         
-        // Much higher threshold for interruption - only clear speech
+        // Only allow interruption with very clear speech
         if (energy > VAD_CONFIG.interruptionThreshold) {
-          console.log(`[Session ${this.streamSid}] User interruption (energy: ${energy.toFixed(3)})`);
+          console.log(`[Session ${this.streamSid}] 🛑 User interruption (energy: ${energy.toFixed(3)})`);
           const pcm16k = upsample8to16(pcm8k);
           const base64Pcm = pcm16ToBase64(pcm16k);
           this.elevenLabs.sendAudio(base64Pcm);
+          // Send commit to trigger interruption
+          this.elevenLabs.endTurn();
         }
         return;
       }
@@ -535,7 +578,7 @@ class CallSession {
       const vadResult = this.vad.processFrame(pcm8k);
       
       if (vadResult.isSpeech && this.vad.turnCommitted) {
-        console.log(`[Session ${this.streamSid}] New speech detected - resetting`);
+        console.log(`[Session ${this.streamSid}] New speech detected - resetting VAD`);
         this.vad.resetForNewTurn();
       }
       
@@ -545,16 +588,16 @@ class CallSession {
         
         if (this.elevenLabs.sendAudio(base64Pcm)) {
           this.audioSentCount++;
-          if (this.audioSentCount % 50 === 0) {
+          if (this.audioSentCount % 100 === 0) {
             console.log(`[Session ${this.streamSid}] Sent ${this.audioSentCount} audio chunks`);
           }
         }
       }
 
       if (vadResult.turnEnded) {
-        console.log(`[Session ${this.streamSid}] ⚡ TURN ENDED at ${vadResult.silenceMs}ms`);
+        console.log(`[Session ${this.streamSid}] ⚡ User turn ended (${vadResult.silenceMs}ms silence)`);
         this.elevenLabs.endTurn();
-        this.agentSpeaking = true;
+        this.agentSpeaking = true; // Expect agent to respond
       }
 
     } catch (error) {
@@ -562,9 +605,6 @@ class CallSession {
     }
   }
 
-  /**
-   * Handle audio coming from ElevenLabs
-   */
   handleElevenLabsAudio(base64Pcm) {
     if (!this.isActive) return;
 
@@ -576,7 +616,7 @@ class CallSession {
       this.sendToTwilio(mulawBuffer.toString('base64'));
 
     } catch (error) {
-      console.error(`[Session ${this.streamSid}] ElevenLabs audio error:`, error);
+      console.error(`[Session ${this.streamSid}] Audio transcode error:`, error);
     }
   }
 
@@ -599,8 +639,11 @@ class CallSession {
   }
 
   close() {
-    console.log(`[Session ${this.streamSid}] Closing - sent ${this.audioSentCount} audio chunks`);
+    console.log(`[Session ${this.streamSid}] Closing - sent ${this.audioSentCount} user audio chunks`);
     this.isActive = false;
+    if (this.greetingTimeout) {
+      clearTimeout(this.greetingTimeout);
+    }
     this.elevenLabs?.close();
   }
 }
@@ -659,7 +702,7 @@ wss.on('connection', (ws, req) => {
         case 'start':
           const streamSid = message.start.streamSid;
           const callSid = message.start.callSid;
-          console.log(`[Twilio] Call started - StreamSid: ${streamSid}, CallSid: ${callSid}`);
+          console.log(`[Twilio] 📞 Call started - StreamSid: ${streamSid}, CallSid: ${callSid}`);
           
           session = new CallSession(streamSid, ws);
           sessions.set(streamSid, session);
@@ -673,7 +716,7 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'stop':
-          console.log('[Twilio] Call stopped');
+          console.log('[Twilio] 📞 Call stopped');
           if (session) {
             session.close();
             sessions.delete(session.streamSid);
@@ -712,7 +755,7 @@ wss.on('connection', (ws, req) => {
 server.listen(PORT, () => {
   console.log(`
 ╔════════════════════════════════════════════════════════════════╗
-║  Twilio ↔ ElevenLabs Audio Bridge                              ║
+║  Twilio ↔ ElevenLabs Audio Bridge v2.0                         ║
 ╠════════════════════════════════════════════════════════════════╣
 ║  Server running on port ${PORT}                                    ║
 ║                                                                ║
