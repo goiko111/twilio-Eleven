@@ -1,7 +1,8 @@
 /**
- * Twilio ↔ ElevenLabs Real-Time Audio Bridge (v8 - LOW LATENCY)
+ * Twilio ↔ ElevenLabs Real-Time Audio Bridge (v9 - VOICE-ONLY)
  *
- * ✅ Optimized timing for faster response
+ * ✅ FIX: Only send audio to ElevenLabs when voice is detected
+ *         This dramatically reduces processing time
  */
 
 const http = require("http");
@@ -18,13 +19,14 @@ const PLAYER_INTERVAL_MS = 20;
 
 const MULAW_SILENCE_FRAME = Buffer.alloc(TWILIO_FRAME_BYTES, 0xff);
 
-// -------------------- VAD / Turn config (OPTIMIZED) --------------------
-const ENERGY_THRESHOLD = 0.015;            // Slightly more sensitive
-const SILENCE_MS_TO_COMMIT = 500;          // ✅ 800 → 500ms (faster commit)
-const MIN_SPOKE_MS_TO_COMMIT = 250;        // ✅ 400 → 250ms (faster commit)
-const ANTI_ECHO_HOLD_MS = 350;             // ✅ 600 → 350ms (faster turn-taking)
+// -------------------- VAD / Turn config --------------------
+const ENERGY_THRESHOLD = 0.012;            // Voice detection threshold
+const SILENCE_MS_TO_COMMIT = 600;          // Commit after 600ms silence
+const MIN_SPOKE_MS_TO_COMMIT = 200;        // Minimum speech before commit
+const ANTI_ECHO_HOLD_MS = 400;             // Anti-echo window
+const VOICE_HANGOVER_MS = 300;             // Keep sending for 300ms after voice stops
 
-const GREETING_DELAY_MS = 500;
+const GREETING_DELAY_MS = 400;
 
 // ============================================================================
 // Mu-law (G.711) utils
@@ -124,7 +126,7 @@ class ElevenLabs {
     this.onAudio = onAudio;
     this.onAgentText = onAgentText;
     this.onUserText = onUserText;
-    this.logPrefix = logPrefix || "[ElevenLabs]";
+    this.logPrefix = logPrefix || "[11L]";
 
     this.ws = null;
     this.ready = false;
@@ -232,6 +234,8 @@ class ElevenLabs {
       this.ws.send(JSON.stringify({ type: "user_audio_commit" }));
       this.commitsSent++;
       this.log(`📤 Commit #${this.commitsSent} (${this.audioChunksSent} chunks)`);
+      // Reset chunk counter after commit
+      this.audioChunksSent = 0;
       return true;
     } catch {
       return false;
@@ -240,7 +244,7 @@ class ElevenLabs {
 
   triggerGreeting() {
     if (!this.ready) return false;
-    this.log("🎬 Triggering greeting...");
+    this.log("🎬 Greeting");
     this.sendAudio(silence16kBase64(100));
     return this.commit();
   }
@@ -268,10 +272,10 @@ class CallSession {
     this.lastAgentAudioAt = 0;
     this.bufferEmptiedAt = 0;
 
+    // Voice detection state
     this.userTalking = false;
     this.userSpeechStartAt = 0;
     this.lastVoiceAt = 0;
-    this.userAudioChunks = 0;
 
     this.eleven = null;
 
@@ -288,14 +292,14 @@ class CallSession {
     this.eleven = new ElevenLabs({
       apiKey: ELEVENLABS_API_KEY,
       agentId: ELEVENLABS_AGENT_ID,
-      logPrefix: `[Session ${this.shortId}] [11L]`,
+      logPrefix: `[${this.shortId}] [11L]`,
       onAudio: (b64) => this.onElevenAudio(b64),
-      onAgentText: (t) => console.log(`[Session ${this.shortId}] [11L] 💬 Agent: ${t.substring(0, 90)}`),
-      onUserText: (t) => console.log(`[Session ${this.shortId}] [11L] 👤 User: ${t}`),
+      onAgentText: (t) => console.log(`[${this.shortId}] [11L] 💬 ${t.substring(0, 80)}`),
+      onUserText: (t) => console.log(`[${this.shortId}] [11L] 👤 ${t}`),
     });
 
     await this.eleven.connect();
-    console.log(`[Session ${this.streamSid}] ElevenLabs connected`);
+    console.log(`[Session ${this.shortId}] ElevenLabs connected`);
 
     this.startPlayer();
 
@@ -344,7 +348,7 @@ class CallSession {
 
         this.frames++;
         if (this.frames % 50 === 0) {
-          console.log(`[Twilio ${this.shortId}] ▶️ frames=${this.frames} queue=${this.outBuf.length}`);
+          console.log(`[Twilio ${this.shortId}] ▶️ f=${this.frames} q=${this.outBuf.length}`);
         }
       } catch {
         this.close("twilio_send_error");
@@ -383,6 +387,7 @@ class CallSession {
 
     const now = Date.now();
 
+    // Anti-echo: don't process while agent is speaking
     if (this.isAgentSpeaking()) {
       return;
     }
@@ -394,34 +399,36 @@ class CallSession {
       return;
     }
 
-    const e = rmsEnergy(pcm8);
+    const energy = rmsEnergy(pcm8);
+    const hasVoice = energy > ENERGY_THRESHOLD;
 
-    if (e > ENERGY_THRESHOLD) {
+    // Track voice activity
+    if (hasVoice) {
       this.lastVoiceAt = now;
       if (!this.userTalking) {
         this.userTalking = true;
         this.userSpeechStartAt = now;
-        console.log(`[Session ${this.shortId}] 🎤 User speaking`);
+        console.log(`[${this.shortId}] 🎤 Speaking`);
       }
     }
 
-    // Always send audio to ElevenLabs
-    const pcm16 = upsample8to16(pcm8);
-    if (this.eleven.sendAudio(pcm16ToBase64(pcm16))) {
-      this.userAudioChunks++;
+    // ✅ ONLY send audio when voice is detected or within hangover period
+    const inHangover = this.lastVoiceAt > 0 && (now - this.lastVoiceAt) < VOICE_HANGOVER_MS;
+    
+    if (hasVoice || inHangover) {
+      const pcm16 = upsample8to16(pcm8);
+      this.eleven.sendAudio(pcm16ToBase64(pcm16));
     }
 
-    // Auto-commit with optimized timing
-    if (this.userTalking) {
+    // Auto-commit when silence detected after speech
+    if (this.userTalking && !hasVoice) {
       const spokeMs = now - this.userSpeechStartAt;
-      const silenceMs = this.lastVoiceAt ? (now - this.lastVoiceAt) : 0;
+      const silenceMs = now - this.lastVoiceAt;
 
       if (silenceMs >= SILENCE_MS_TO_COMMIT && spokeMs >= MIN_SPOKE_MS_TO_COMMIT) {
-        console.log(`[Session ${this.shortId}] ⚡ Commit (silence=${silenceMs}ms spoke=${spokeMs}ms)`);
+        console.log(`[${this.shortId}] ⚡ Commit (${silenceMs}ms silence, ${spokeMs}ms spoke)`);
         this.userTalking = false;
         this.userSpeechStartAt = 0;
-        this.lastVoiceAt = 0;
-        this.userAudioChunks = 0;
         this.eleven.commit();
       }
     }
@@ -472,7 +479,7 @@ const wss = new WebSocket.Server({ server });
 const sessions = new Map();
 
 wss.on("connection", (ws, req) => {
-  console.log(`[Server] New WebSocket connection from ${req.url}`);
+  console.log(`[Server] WS connection from ${req.url}`);
   if (req.url !== "/twilio-stream") {
     ws.close();
     return;
@@ -492,7 +499,7 @@ wss.on("connection", (ws, req) => {
     if (msg.event === "start") {
       const streamSid = msg.start?.streamSid;
       const callSid = msg.start?.callSid;
-      console.log(`[Twilio] 📞 start streamSid=${streamSid} callSid=${callSid}`);
+      console.log(`[Twilio] 📞 start sid=${streamSid?.slice(0,8)}`);
 
       session = new CallSession(streamSid, ws);
       sessions.set(streamSid, session);
@@ -500,7 +507,7 @@ wss.on("connection", (ws, req) => {
       try {
         await session.start();
       } catch (e) {
-        console.log(`[Session ${streamSid}] start error: ${e?.message || e}`);
+        console.log(`[Session] start error: ${e?.message || e}`);
         session.close("start_error");
       }
       return;
@@ -524,7 +531,7 @@ wss.on("connection", (ws, req) => {
   });
 
   ws.on("close", (code, reason) => {
-    console.log(`[Twilio] WS close code=${code} reason=${reason?.toString?.() || ""}`);
+    console.log(`[Twilio] WS close code=${code}`);
     if (session) {
       session.close("twilio_ws_close");
       sessions.delete(session.streamSid);
@@ -536,12 +543,9 @@ wss.on("connection", (ws, req) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`   TwiML:  https://your-domain/twiml`);
-  console.log(`   Health: https://your-domain/health`);
-
+  console.log(`🚀 Server on port ${PORT}`);
   if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
-    console.log("⚠️  Missing ELEVENLABS_API_KEY or ELEVENLABS_AGENT_ID");
+    console.log("⚠️  Missing ELEVENLABS env vars");
   }
 });
 
