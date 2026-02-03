@@ -30,7 +30,7 @@ const VAD_CONFIG = {
   frameSize: 160,               // Samples per frame (20ms at 8kHz)
   minSpeechFrames: 4,           // Minimum frames to confirm speech (80ms)
   maxSilenceBeforeGate: 350,    // Stop sending audio after 350ms silence (pre-commit)
-  interruptionThreshold: 0.08,  // Very high threshold for interruption detection
+  interruptionThreshold: 0.25,  // VERY high threshold - only clear speech interrupts
 };
 
 // Audio Configuration
@@ -607,16 +607,16 @@ class CallSession {
       // Calculate energy for logging
       const energy = this.vad.calculateEnergy(pcm8k);
       
-      // While agent is speaking, only check for very loud interruptions
+      // While agent is speaking, only allow very loud interruptions
       if (this.agentSpeaking) {
-        // Only allow interruption with very clear speech
+        // Only allow interruption with VERY clear speech (0.25 is quite loud)
         if (energy > VAD_CONFIG.interruptionThreshold) {
           console.log(`[Session ${this.streamSid}] 🛑 User interruption (energy: ${energy.toFixed(3)})`);
           const pcm16k = upsample8to16(pcm8k);
           const base64Pcm = pcm16ToBase64(pcm16k);
           this.elevenLabs.sendAudio(base64Pcm);
-          // Send commit to trigger interruption
-          this.elevenLabs.endTurn();
+          // DON'T send commit here - let ElevenLabs handle the interruption
+          // The interruption event from ElevenLabs will reset our state
         }
         return;
       }
