@@ -1,7 +1,7 @@
 /**
- * Twilio ↔ ElevenLabs Real-Time Audio Bridge (v7 - BUFFER FIX)
+ * Twilio ↔ ElevenLabs Real-Time Audio Bridge (v8 - LOW LATENCY)
  *
- * ✅ FIX: Clear residual buffer bytes that are less than a full frame
+ * ✅ Optimized timing for faster response
  */
 
 const http = require("http");
@@ -18,13 +18,13 @@ const PLAYER_INTERVAL_MS = 20;
 
 const MULAW_SILENCE_FRAME = Buffer.alloc(TWILIO_FRAME_BYTES, 0xff);
 
-// -------------------- VAD / Turn config --------------------
-const ENERGY_THRESHOLD = 0.02;
-const SILENCE_MS_TO_COMMIT = 800;
-const MIN_SPOKE_MS_TO_COMMIT = 400;
-const ANTI_ECHO_HOLD_MS = 600;
+// -------------------- VAD / Turn config (OPTIMIZED) --------------------
+const ENERGY_THRESHOLD = 0.015;            // Slightly more sensitive
+const SILENCE_MS_TO_COMMIT = 500;          // ✅ 800 → 500ms (faster commit)
+const MIN_SPOKE_MS_TO_COMMIT = 250;        // ✅ 400 → 250ms (faster commit)
+const ANTI_ECHO_HOLD_MS = 350;             // ✅ 600 → 350ms (faster turn-taking)
 
-const GREETING_DELAY_MS = 700;
+const GREETING_DELAY_MS = 500;
 
 // ============================================================================
 // Mu-law (G.711) utils
@@ -118,14 +118,12 @@ function silence16kBase64(ms = 100) {
 // ElevenLabs client
 // ============================================================================
 class ElevenLabs {
-  constructor({ apiKey, agentId, onAudio, onAgentText, onUserText, onReady, onClose, logPrefix }) {
+  constructor({ apiKey, agentId, onAudio, onAgentText, onUserText, logPrefix }) {
     this.apiKey = apiKey;
     this.agentId = agentId;
     this.onAudio = onAudio;
     this.onAgentText = onAgentText;
     this.onUserText = onUserText;
-    this.onReady = onReady;
-    this.onClose = onClose;
     this.logPrefix = logPrefix || "[ElevenLabs]";
 
     this.ws = null;
@@ -167,7 +165,6 @@ class ElevenLabs {
         if (msg.type === "conversation_initiation_metadata") {
           this.ready = true;
           this.log("✅ ready");
-          this.onReady?.();
           resolve();
           return;
         }
@@ -198,7 +195,6 @@ class ElevenLabs {
       this.ws.on("close", (code, reason) => {
         this.ready = false;
         this.log(`WS close code=${code} reason=${reason?.toString?.() || ""}`);
-        this.onClose?.(code, reason?.toString?.() || "");
       });
 
       this.ws.on("error", (err) => {
@@ -206,7 +202,6 @@ class ElevenLabs {
         reject(err);
       });
 
-      // Timeout
       setTimeout(() => resolve(), 8000);
     });
   }
@@ -223,25 +218,22 @@ class ElevenLabs {
       }));
       this.audioChunksSent++;
       return true;
-    } catch (err) {
-      this.log(`❌ sendAudio error: ${err?.message || err}`);
+    } catch {
       return false;
     }
   }
 
   commit() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) {
-      this.log(`⚠️ Cannot commit: not ready`);
       return false;
     }
     
     try {
       this.ws.send(JSON.stringify({ type: "user_audio_commit" }));
       this.commitsSent++;
-      this.log(`📤 Commit #${this.commitsSent} (${this.audioChunksSent} chunks total)`);
+      this.log(`📤 Commit #${this.commitsSent} (${this.audioChunksSent} chunks)`);
       return true;
-    } catch (err) {
-      this.log(`❌ commit error: ${err?.message || err}`);
+    } catch {
       return false;
     }
   }
@@ -249,7 +241,7 @@ class ElevenLabs {
   triggerGreeting() {
     if (!this.ready) return false;
     this.log("🎬 Triggering greeting...");
-    this.sendAudio(silence16kBase64(120));
+    this.sendAudio(silence16kBase64(100));
     return this.commit();
   }
 
@@ -296,12 +288,10 @@ class CallSession {
     this.eleven = new ElevenLabs({
       apiKey: ELEVENLABS_API_KEY,
       agentId: ELEVENLABS_AGENT_ID,
-      logPrefix: `[Session ${this.shortId}] [ElevenLabs]`,
-      onReady: () => {},
+      logPrefix: `[Session ${this.shortId}] [11L]`,
       onAudio: (b64) => this.onElevenAudio(b64),
-      onAgentText: (t) => console.log(`[Session ${this.shortId}] [ElevenLabs] 💬 Agent: ${t.substring(0, 90)}`),
-      onUserText: (t) => console.log(`[Session ${this.shortId}] [ElevenLabs] 👤 User: ${t}`),
-      onClose: () => {},
+      onAgentText: (t) => console.log(`[Session ${this.shortId}] [11L] 💬 Agent: ${t.substring(0, 90)}`),
+      onUserText: (t) => console.log(`[Session ${this.shortId}] [11L] 👤 User: ${t}`),
     });
 
     await this.eleven.connect();
@@ -326,11 +316,10 @@ class CallSession {
       const now = Date.now();
       let frame;
 
-      // ✅ FIX: Clear residual buffer if it's less than a full frame
-      // and no new audio has arrived recently
+      // Clear residual buffer
       if (this.outBuf.length > 0 && 
           this.outBuf.length < TWILIO_FRAME_BYTES && 
-          (now - this.lastAgentAudioAt) > 200) {
+          (now - this.lastAgentAudioAt) > 150) {
         this.outBuf = Buffer.alloc(0);
         this.bufferEmptiedAt = now;
       }
@@ -366,12 +355,10 @@ class CallSession {
   isAgentSpeaking() {
     const now = Date.now();
 
-    // Agent speaking if buffer has a full frame of audio
     if (this.outBuf.length >= TWILIO_FRAME_BYTES) {
       return true;
     }
 
-    // Or if buffer just emptied recently
     if (this.bufferEmptiedAt > 0 && (now - this.bufferEmptiedAt) < ANTI_ECHO_HOLD_MS) {
       return true;
     }
@@ -414,24 +401,23 @@ class CallSession {
       if (!this.userTalking) {
         this.userTalking = true;
         this.userSpeechStartAt = now;
-        console.log(`[Session ${this.shortId}] 🎤 User started speaking (energy=${e.toFixed(3)})`);
+        console.log(`[Session ${this.shortId}] 🎤 User speaking`);
       }
     }
 
     // Always send audio to ElevenLabs
     const pcm16 = upsample8to16(pcm8);
-    const sent = this.eleven.sendAudio(pcm16ToBase64(pcm16));
-    if (sent) {
+    if (this.eleven.sendAudio(pcm16ToBase64(pcm16))) {
       this.userAudioChunks++;
     }
 
-    // Auto-commit
+    // Auto-commit with optimized timing
     if (this.userTalking) {
       const spokeMs = now - this.userSpeechStartAt;
       const silenceMs = this.lastVoiceAt ? (now - this.lastVoiceAt) : 0;
 
       if (silenceMs >= SILENCE_MS_TO_COMMIT && spokeMs >= MIN_SPOKE_MS_TO_COMMIT) {
-        console.log(`[Session ${this.shortId}] ⚡ Auto-commit (silence ${silenceMs}ms, spoke ${spokeMs}ms, chunks=${this.userAudioChunks})`);
+        console.log(`[Session ${this.shortId}] ⚡ Commit (silence=${silenceMs}ms spoke=${spokeMs}ms)`);
         this.userTalking = false;
         this.userSpeechStartAt = 0;
         this.lastVoiceAt = 0;
