@@ -416,7 +416,12 @@ class ElevenLabsClient {
         break;
 
       case 'ping':
-        this.send({ type: 'pong', event_id: message.event_id });
+        console.log(`[ElevenLabs] 📨 Ping received, event_id: ${message.event_id || 'none'}`);
+        if (message.event_id) {
+          this.send({ type: 'pong', event_id: message.event_id });
+        } else {
+          this.send({ type: 'pong' });
+        }
         break;
 
       case 'conversation_initiation_metadata':
@@ -460,7 +465,12 @@ class ElevenLabsClient {
   }
 
   sendAudio(base64Audio) {
-    if (!this.isConnected || !this.isSessionReady) {
+    if (!this.isConnected) {
+      console.log('[ElevenLabs] ⚠️ Cannot send audio - not connected');
+      return false;
+    }
+    if (!this.isSessionReady) {
+      console.log('[ElevenLabs] ⚠️ Cannot send audio - session not ready');
       return false;
     }
     
@@ -476,6 +486,20 @@ class ElevenLabsClient {
   }
 
   endTurn() {
+    if (!this.isConnected || !this.isSessionReady) {
+      console.log('[ElevenLabs] ⚠️ Cannot end turn - not connected/ready');
+      return;
+    }
+    
+    this.turnCommitTime = Date.now();
+    console.log('[ElevenLabs] ⚡ User turn commit');
+    
+    this.send({
+      type: 'user_audio_commit'
+    });
+  }
+
+  endTurn() {
     if (!this.isConnected || !this.isSessionReady) return;
     
     this.turnCommitTime = Date.now();
@@ -488,7 +512,14 @@ class ElevenLabsClient {
 
   send(message) {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(message));
+      const payload = JSON.stringify(message);
+      // Log all outgoing messages (except audio chunks which are too large)
+      if (message.type !== 'user_audio_chunk') {
+        console.log(`[ElevenLabs] 📤 Sending: ${payload.substring(0, 150)}`);
+      }
+      this.ws.send(payload);
+    } else {
+      console.log(`[ElevenLabs] ⚠️ Cannot send - WebSocket not open (state: ${this.ws?.readyState})`);
     }
   }
 
@@ -569,10 +600,11 @@ class CallSession {
         return;
       }
       
+      // Calculate energy for logging
+      const energy = this.vad.calculateEnergy(pcm8k);
+      
       // While agent is speaking, only check for very loud interruptions
       if (this.agentSpeaking) {
-        const energy = this.vad.calculateEnergy(pcm8k);
-        
         // Only allow interruption with very clear speech
         if (energy > VAD_CONFIG.interruptionThreshold) {
           console.log(`[Session ${this.streamSid}] 🛑 User interruption (energy: ${energy.toFixed(3)})`);
