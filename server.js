@@ -508,6 +508,21 @@ class CallSession {
       // Decode mu-law to PCM16
       const pcm8k = decodeMulaw(mulawBuffer);
       
+      // CRITICAL: Skip VAD processing while agent is speaking
+      // We still send audio for potential interruption detection by ElevenLabs
+      if (this.agentSpeaking) {
+        // Check for user interruption (high energy = user speaking over agent)
+        const energy = this.vad.calculateEnergy(pcm8k);
+        if (energy > VAD_CONFIG.energyThreshold * 2) { // Higher threshold for interruption
+          console.log(`[Session ${this.streamSid}] User interruption detected during agent speech`);
+          // Just send the audio - ElevenLabs will handle the interruption
+          const pcm16k = upsample8to16(pcm8k);
+          const base64Pcm = pcm16ToBase64(pcm16k);
+          this.elevenLabs.sendAudio(base64Pcm);
+        }
+        return; // Don't process VAD turn detection while agent speaks
+      }
+      
       // Run VAD on 8kHz audio - this decides if we should send audio
       const vadResult = this.vad.processFrame(pcm8k);
       
@@ -515,7 +530,6 @@ class CallSession {
       if (vadResult.isSpeech && this.vad.turnCommitted) {
         console.log(`[Session ${this.streamSid}] New speech detected - resetting for new turn`);
         this.vad.resetForNewTurn();
-        this.agentSpeaking = false;
       }
       
       // CRITICAL: Only send audio if VAD says so
