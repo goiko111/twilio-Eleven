@@ -24,14 +24,16 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
 // VAD Configuration - tuned for telephony
+// Based on actual measurements: noise floor ~0.0002-0.0003, speech ~0.08-0.17
 const VAD_CONFIG = {
-  silenceThresholdMs: 420,      // End turn after 420ms silence
-  energyThreshold: 0.08,        // Much higher threshold - telephony noise floor is ~0.04-0.06
+  silenceThresholdMs: 800,      // End turn after 800ms silence (was 420ms - too aggressive)
+  energyThreshold: 0.05,        // Slightly lower to catch softer speech (0.08 was cutting off speech)
   frameSize: 160,               // Samples per frame (20ms at 8kHz)
-  minSpeechFrames: 8,           // Minimum frames to confirm speech (160ms) - more robust
-  maxSilenceBeforeGate: 300,    // Stop sending audio after 300ms silence (pre-commit)
-  interruptionThreshold: 0.25,  // VERY high threshold - only clear speech interrupts
-  minAudioChunksForCommit: 15,  // Require at least 15 audio chunks before allowing commit
+  minSpeechFrames: 5,           // Minimum frames to confirm speech (100ms)
+  maxSilenceBeforeGate: 500,    // Stop sending audio after 500ms silence (pre-commit)
+  interruptionThreshold: 0.15,  // Allow interruptions with clearer speech
+  minAudioChunksForCommit: 25,  // Require at least 25 audio chunks (~500ms of activity)
+  minSpeechDurationMs: 200,     // Minimum speech duration before allowing commit
 };
 
 // Energy logging configuration
