@@ -25,12 +25,13 @@ const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
 // VAD Configuration - tuned for telephony
 const VAD_CONFIG = {
-  silenceThresholdMs: 500,      // End turn after 500ms silence
-  energyThreshold: 0.02,        // Higher threshold for telephony noise floor
+  silenceThresholdMs: 420,      // End turn after 420ms silence
+  energyThreshold: 0.04,        // Higher threshold to filter telephony noise
   frameSize: 160,               // Samples per frame (20ms at 8kHz)
-  minSpeechFrames: 4,           // Minimum frames to confirm speech (80ms)
-  maxSilenceBeforeGate: 350,    // Stop sending audio after 350ms silence (pre-commit)
+  minSpeechFrames: 6,           // Minimum frames to confirm speech (120ms) - more robust
+  maxSilenceBeforeGate: 300,    // Stop sending audio after 300ms silence (pre-commit)
   interruptionThreshold: 0.25,  // VERY high threshold - only clear speech interrupts
+  minAudioChunksForCommit: 10,  // Require at least 10 audio chunks before allowing commit
 };
 
 // Agent speaking timeout - how long after last audio chunk to consider agent done
@@ -179,6 +180,7 @@ class SimpleVAD {
     this.isSpeaking = false;
     this.turnCommitted = false;
     this.audioGated = false;
+    this.audioChunksSent = 0; // Track how many chunks we've actually sent
   }
 
   /**
@@ -267,6 +269,15 @@ class SimpleVAD {
     this.isSpeaking = false;
     this.turnCommitted = false;
     this.audioGated = false;
+    this.audioChunksSent = 0;
+  }
+
+  incrementAudioChunks() {
+    this.audioChunksSent++;
+  }
+
+  hasEnoughAudioForCommit() {
+    return this.audioChunksSent >= this.config.minAudioChunksForCommit;
   }
 }
 
@@ -511,17 +522,6 @@ class ElevenLabsClient {
     });
   }
 
-  endTurn() {
-    if (!this.isConnected || !this.isSessionReady) return;
-    
-    this.turnCommitTime = Date.now();
-    console.log('[ElevenLabs] ⚡ User turn commit');
-    
-    this.send({
-      type: 'user_audio_commit'
-    });
-  }
-
   send(message) {
     if (this.ws?.readyState === WebSocket.OPEN) {
       const payload = JSON.stringify(message);
@@ -665,6 +665,7 @@ class CallSession {
         
         if (this.elevenLabs.sendAudio(base64Pcm)) {
           this.audioSentCount++;
+          this.vad.incrementAudioChunks();
           if (this.audioSentCount % 100 === 0) {
             console.log(`[Session ${this.streamSid}] Sent ${this.audioSentCount} audio chunks`);
           }
@@ -672,9 +673,15 @@ class CallSession {
       }
 
       if (vadResult.turnEnded) {
-        console.log(`[Session ${this.streamSid}] ⚡ User turn ended (${vadResult.silenceMs}ms silence)`);
-        this.elevenLabs.endTurn();
-        this.agentSpeaking = true; // Expect agent to respond
+        // Only commit if we have enough audio to be considered real speech
+        if (this.vad.hasEnoughAudioForCommit()) {
+          console.log(`[Session ${this.streamSid}] ⚡ User turn ended (${vadResult.silenceMs}ms silence, ${this.vad.audioChunksSent} chunks)`);
+          this.elevenLabs.endTurn();
+          this.agentSpeaking = true; // Expect agent to respond
+        } else {
+          console.log(`[Session ${this.streamSid}] 🔇 Turn ended but not enough audio (${this.vad.audioChunksSent} chunks) - ignoring`);
+          this.vad.resetForNewTurn();
+        }
       }
 
     } catch (error) {
