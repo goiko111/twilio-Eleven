@@ -1,64 +1,50 @@
 /**
- * Twilio ↔ ElevenLabs Real-Time Audio Bridge v3.1 (COPY/PASTE)
+ * Twilio ↔ ElevenLabs Real-Time Audio Bridge v3.2 (NO-BARGE-IN, anti-echo gate)
  *
  * Fixes:
- * - ✅ Twilio playback in 20ms frames (160 bytes mulaw @8k) via queue
- * - ✅ ElevenLabs user turn commit uses { type: "user_audio_commit" } (THIS WAS THE BUG)
- * - ✅ ElevenLabs audio chunks sent as { user_audio_chunk: base64PCM16_16k } (no type wrapper)
- * - ✅ Agent turn-end waits for Twilio queue to drain (prevents “hablo y no me oye”)
- *
- * ENV:
- * - ELEVENLABS_API_KEY
- * - ELEVENLABS_AGENT_ID
- * - PORT (optional)
+ * - Disables interruption/barge-in (echo was triggering infinite "interruptions")
+ * - Ignores inbound audio while agent is speaking OR while Twilio outQueue still has audio
+ * - Uses ElevenLabs message format that matches your working logs: {type:'user_audio_chunk', user_audio_chunk:...}
  */
 
 const WebSocket = require("ws");
 const http = require("http");
 
-// ============================================================================
-// CONFIG
-// ============================================================================
-
 const PORT = process.env.PORT || 8080;
 const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
-// Noise floor telephony ~0.0002, speech often 0.05–0.20
+// -------------------- VAD (telephony) --------------------
 const VAD_CONFIG = {
-  silenceThresholdMs: 800,
-  energyThreshold: 0.02,
-  frameSize: 160, // 20ms @ 8kHz
-  minSpeechFrames: 4,
-  maxSilenceBeforeGate: 500,
-  interruptionThreshold: 0.08,
-  minAudioChunksForCommit: 20,
+  silenceThresholdMs: 800,     // end turn after 800ms silence
+  energyThreshold: 0.02,       // based on your measured speech/noise
+  frameSize: 160,              // 20ms @ 8kHz
+  minSpeechFrames: 4,          // 80ms
+  maxSilenceBeforeGate: 500,   // stop sending after 500ms silence (pre-commit)
+  minAudioChunksForCommit: 20, // require at least ~400ms of chunks to commit
 };
 
 const LOG_ENERGY_EVERY_N_FRAMES = 50; // ~1s
+const ELEVENLABS_SAMPLE_RATE = 16000;
+const TWILIO_FRAME_SIZE = 160; // 20ms of G.711 mu-law bytes @8kHz
 
-// IMPORTANT: don't end agent too early; also wait for Twilio queue drain
+// Agent speaking timeout (only to help state; real gate is queue-drain)
 const AGENT_AUDIO_TIMEOUT_MS = 1500;
 
-const TWILIO_SAMPLE_RATE = 8000;
-const ELEVENLABS_SAMPLE_RATE = 16000;
-
-const TWILIO_FRAME_BYTES = 160; // 20ms of mulaw @ 8k => 160 bytes
-
-const OUTBOUND_GREETING_DELAY_MS = 800;
+// Greeting timing
+const OUTBOUND_GREETING_DELAY_MS = 600;
 const GREETING_TIMEOUT_MS = 2500;
 
-// ============================================================================
-// AUDIO UTILS (mulaw <-> pcm16) + resample
-// ============================================================================
+// -------------------- AUDIO UTILS --------------------
 
+// Mu-law decode table
 const MULAW_DECODE_TABLE = new Int16Array(256);
 (function initMulawTable() {
   for (let i = 0; i < 256; i++) {
     let mulaw = ~i;
-    let sign = mulaw & 0x80 ? -1 : 1;
+    let sign = (mulaw & 0x80) ? -1 : 1;
     let exponent = (mulaw >> 4) & 0x07;
-    let mantissa = mulaw & 0x0f;
+    let mantissa = mulaw & 0x0F;
     let sample = (mantissa << 3) + 0x84;
     sample <<= exponent;
     sample -= 0x84;
@@ -67,7 +53,7 @@ const MULAW_DECODE_TABLE = new Int16Array(256);
 })();
 
 function linearToMulaw(sample) {
-  const MULAW_MAX = 0x1fff;
+  const MULAW_MAX = 0x1FFF;
   const MULAW_BIAS = 33;
 
   let sign = (sample >> 8) & 0x80;
@@ -75,12 +61,12 @@ function linearToMulaw(sample) {
   if (sample > MULAW_MAX) sample = MULAW_MAX;
 
   sample += MULAW_BIAS;
-
   let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1);
 
-  let mantissa = (sample >> (exponent + 3)) & 0x0f;
+  let mantissa = (sample >> (exponent + 3)) & 0x0F;
   let mulawByte = ~(sign | (exponent << 4) | mantissa);
+
   return mulawByte & 0xff;
 }
 
@@ -131,9 +117,7 @@ function generateSilence16k(durationMs) {
   return new Int16Array(numSamples);
 }
 
-// ============================================================================
-// VAD
-// ============================================================================
+// -------------------- VAD --------------------
 
 class SimpleVAD {
   constructor(config = VAD_CONFIG) {
@@ -151,6 +135,18 @@ class SimpleVAD {
     this.frameCount = 0;
     this.maxEnergy = 0;
     this.recentEnergies = [];
+  }
+
+  resetForNewTurn() {
+    this.reset();
+  }
+
+  incrementAudioChunks() {
+    this.audioChunksSent++;
+  }
+
+  hasEnoughAudioForCommit() {
+    return this.audioChunksSent >= this.config.minAudioChunksForCommit;
   }
 
   calculateEnergy(samples) {
@@ -178,9 +174,7 @@ class SimpleVAD {
     if (this.frameCount % LOG_ENERGY_EVERY_N_FRAMES === 0) {
       const avgEnergy = this.recentEnergies.reduce((a, b) => a + b, 0) / this.recentEnergies.length;
       console.log(
-        `[VAD ${sessionId}] 📊 Energy: current=${energy.toFixed(4)}, avg=${avgEnergy.toFixed(
-          4
-        )}, max=${this.maxEnergy.toFixed(4)}, threshold=${this.config.energyThreshold}, speaking=${this.isSpeaking}`
+        `[VAD ${sessionId}] 📊 Energy: current=${energy.toFixed(4)}, avg=${avgEnergy.toFixed(4)}, max=${this.maxEnergy.toFixed(4)}, threshold=${this.config.energyThreshold}, speaking=${this.isSpeaking}`
       );
     }
 
@@ -195,13 +189,16 @@ class SimpleVAD {
         if (!this.isSpeaking) console.log(`[VAD ${sessionId}] 🎤 Speech started (energy: ${energy.toFixed(4)})`);
         this.isSpeaking = true;
       }
+
       return { isSpeech: true, turnEnded: false, shouldSendAudio: true, silenceMs: 0 };
     }
 
     this.silentFrames++;
-    const silenceMs = (this.silentFrames * this.config.frameSize / TWILIO_SAMPLE_RATE) * 1000;
+    const silenceMs = (this.silentFrames * this.config.frameSize / 8000) * 1000;
 
-    if (!this.isSpeaking) return { isSpeech: false, turnEnded: false, shouldSendAudio: false, silenceMs: 0 };
+    if (!this.isSpeaking) {
+      return { isSpeech: false, turnEnded: false, shouldSendAudio: false, silenceMs: 0 };
+    }
 
     if (silenceMs >= this.config.maxSilenceBeforeGate) this.audioGated = true;
 
@@ -212,38 +209,15 @@ class SimpleVAD {
 
     return { isSpeech: false, turnEnded: false, shouldSendAudio: !this.audioGated, silenceMs };
   }
-
-  resetForNewTurn() {
-    this.silentFrames = 0;
-    this.speechFrames = 0;
-    this.isSpeaking = false;
-    this.turnCommitted = false;
-    this.audioGated = false;
-    this.audioChunksSent = 0;
-    this.frameCount = 0;
-    this.maxEnergy = 0;
-    this.recentEnergies = [];
-  }
-
-  incrementAudioChunks() {
-    this.audioChunksSent++;
-  }
-
-  hasEnoughAudioForCommit() {
-    return this.audioChunksSent >= this.config.minAudioChunksForCommit;
-  }
 }
 
-// ============================================================================
-// ELEVENLABS CLIENT
-// ============================================================================
+// -------------------- ElevenLabs Client --------------------
 
 class ElevenLabsClient {
-  constructor(apiKey, agentId, onAudio, onError, onAgentStateChange) {
+  constructor(apiKey, agentId, onAudio, onAgentStateChange) {
     this.apiKey = apiKey;
     this.agentId = agentId;
     this.onAudio = onAudio;
-    this.onError = onError;
     this.onAgentStateChange = onAgentStateChange;
 
     this.ws = null;
@@ -257,77 +231,61 @@ class ElevenLabsClient {
     this.greetingTriggered = false;
 
     this.agentAudioTimeout = null;
-    this.pendingTurnEnd = false;
   }
 
   async connect() {
-    return new Promise(async (resolve, reject) => {
-      try {
-        const response = await fetch(
-          `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${this.agentId}`,
-          { headers: { "xi-api-key": this.apiKey } }
-        );
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${this.agentId}`,
+      { headers: { "xi-api-key": this.apiKey } }
+    );
+    if (!response.ok) throw new Error(await response.text());
+    const { signed_url } = await response.json();
 
-        if (!response.ok) {
-          const error = await response.text();
-          throw new Error(`Failed to get signed URL: ${error}`);
-        }
+    console.log("[ElevenLabs] Got signed URL, connecting...");
+    this.ws = new WebSocket(signed_url);
 
-        const { signed_url } = await response.json();
-        console.log("[ElevenLabs] Got signed URL, connecting...");
+    await new Promise((resolve, reject) => {
+      const t = setTimeout(() => resolve(), 6000);
 
-        this.ws = new WebSocket(signed_url);
+      this.ws.on("open", () => {
+        console.log("[ElevenLabs] WebSocket connected");
+        this.isConnected = true;
+      });
 
-        this.ws.on("open", () => {
-          console.log("[ElevenLabs] WebSocket connected");
-          this.isConnected = true;
-        });
+      this.ws.on("message", (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          this.handleMessage(msg);
 
-        this.ws.on("message", (data) => {
-          try {
-            const message = JSON.parse(data.toString());
-            this.handleMessage(message);
-
-            if (message.type === "conversation_initiation_metadata" && !this.isSessionReady) {
-              this.isSessionReady = true;
-              console.log("[ElevenLabs] ✅ Session ready");
-              resolve();
-            }
-          } catch (e) {
-            console.error("[ElevenLabs] Failed to parse message:", e);
-          }
-        });
-
-        this.ws.on("close", (code, reason) => {
-          console.log(`[ElevenLabs] WebSocket closed: ${code} - ${reason}`);
-          this.isConnected = false;
-          this.isSessionReady = false;
-          this.hasReceivedAudio = false;
-          this.isAgentSpeaking = false;
-        });
-
-        this.ws.on("error", (error) => {
-          console.error("[ElevenLabs] WebSocket error:", error.message);
-          this.onError?.(error);
-          reject(error);
-        });
-
-        setTimeout(() => {
-          if (!this.isSessionReady) {
-            console.log("[ElevenLabs] Connection timeout");
+          if (msg.type === "conversation_initiation_metadata" && !this.isSessionReady) {
+            this.isSessionReady = true;
+            console.log("[ElevenLabs] ✅ Session ready");
+            clearTimeout(t);
             resolve();
           }
-        }, 5000);
-      } catch (error) {
-        console.error("[ElevenLabs] Connection error:", error);
-        reject(error);
-      }
+        } catch (e) {
+          console.error("[ElevenLabs] Failed to parse message:", e);
+        }
+      });
+
+      this.ws.on("error", (err) => {
+        clearTimeout(t);
+        reject(err);
+      });
+
+      this.ws.on("close", (code, reason) => {
+        console.log(`[ElevenLabs] WebSocket closed: ${code} - ${reason}`);
+        this.isConnected = false;
+        this.isSessionReady = false;
+        this.hasReceivedAudio = false;
+        this.isAgentSpeaking = false;
+      });
     });
   }
 
   handleMessage(message) {
     if (message.type !== "ping") {
-      console.log(`[ElevenLabs] 📨 Event type: ${message.type}`, JSON.stringify(message).substring(0, 200));
+      console.log("[ElevenLabs] 📨 Event type:", message.type, JSON.stringify(message).substring(0, 200));
     }
 
     switch (message.type) {
@@ -348,9 +306,8 @@ class ElevenLabsClient {
 
         if (!this.isAgentSpeaking) {
           this.isAgentSpeaking = true;
-          this.pendingTurnEnd = false;
           console.log("[ElevenLabs] 🎙️ Agent started speaking");
-          this.onAgentStateChange?.(true, false);
+          this.onAgentStateChange?.(true);
         }
 
         this.resetAgentAudioTimeout();
@@ -367,28 +324,27 @@ class ElevenLabsClient {
         break;
 
       case "turn_end":
-        // Some agents emit explicit end events
-        console.log("[ElevenLabs] Agent turn ended (event)");
+        console.log("[ElevenLabs] Agent turn ended");
         this.isAgentSpeaking = false;
         this.hasReceivedAudio = false;
-        this.pendingTurnEnd = false;
-        this.onAgentStateChange?.(false, false);
+        this.onAgentStateChange?.(false);
+        break;
+
+      case "interruption":
+        console.log("[ElevenLabs] ⚠️ Interruption event (from server)");
+        this.isAgentSpeaking = false;
+        this.hasReceivedAudio = false;
+        this.onAgentStateChange?.(false);
         break;
 
       case "ping": {
         const pingEventId = message.ping_event?.event_id || message.event_id;
-        if (pingEventId && this.ws?.readyState === WebSocket.OPEN) {
-          const payload = JSON.stringify({ type: "pong", event_id: pingEventId });
-          this.ws.send(payload);
-        }
+        if (pingEventId) this.send({ type: "pong", event_id: pingEventId }, true);
         break;
       }
 
       case "conversation_initiation_metadata":
-        console.log(
-          "[ElevenLabs] Session initialized, config:",
-          JSON.stringify(message.conversation_initiation_metadata_event || {}).substring(0, 200)
-        );
+        console.log("[ElevenLabs] Session initialized, config:", JSON.stringify(message.conversation_initiation_metadata_event || {}).substring(0, 200));
         break;
 
       default:
@@ -396,47 +352,28 @@ class ElevenLabsClient {
     }
   }
 
-  // Send raw objects
-  send(obj) {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
-    const payload = JSON.stringify(obj);
-
-    // Avoid noisy logs for audio chunks
-    if (!obj.user_audio_chunk && obj.type !== "pong") {
-      console.log(`[ElevenLabs] 📤 Sending: ${payload.substring(0, 150)}`);
-    }
-    this.ws.send(payload);
-  }
-
-  // OUTBOUND greeting: send 100ms silence chunk then commit using type
   triggerGreeting() {
     if (this.greetingTriggered || !this.isSessionReady) return;
-
     this.greetingTriggered = true;
+
     console.log("[ElevenLabs] 🚀 Triggering agent greeting...");
 
-    const silence = generateSilence16k(100);
+    const silence = generateSilence16k(120);
     const base64Silence = pcm16ToBase64(silence);
 
-    // chunk: no type wrapper
-    this.send({ user_audio_chunk: base64Silence });
-
+    this.send({ type: "user_audio_chunk", user_audio_chunk: base64Silence });
     this.turnCommitTime = Date.now();
-
-    // ✅ commit MUST be with type (this was your bug)
     this.send({ type: "user_audio_commit" });
 
     console.log("[ElevenLabs] ✅ Greeting trigger sent");
   }
 
-  // User audio chunks: no type wrapper
-  sendAudio(base64Pcm16_16k) {
+  sendAudio(base64Audio) {
     if (!this.isConnected || !this.isSessionReady) return false;
-    this.send({ user_audio_chunk: base64Pcm16_16k });
+    this.send({ type: "user_audio_chunk", user_audio_chunk: base64Audio });
     return true;
   }
 
-  // ✅ commit MUST be with type
   endTurn() {
     if (!this.isConnected || !this.isSessionReady) return;
     this.turnCommitTime = Date.now();
@@ -444,25 +381,23 @@ class ElevenLabsClient {
     this.send({ type: "user_audio_commit" });
   }
 
-  resetAgentAudioTimeout() {
-    if (this.agentAudioTimeout) clearTimeout(this.agentAudioTimeout);
-
-    this.agentAudioTimeout = setTimeout(() => {
-      if (this.isAgentSpeaking) {
-        // Mark pending; CallSession will confirm when Twilio queue drains
-        this.pendingTurnEnd = true;
-        console.log("[ElevenLabs] ⏱️ Agent audio timeout - pending turn end (wait queue drain)");
-        this.onAgentStateChange?.(false, true);
-      }
-    }, AGENT_AUDIO_TIMEOUT_MS);
+  send(message, isPong = false) {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    const payload = JSON.stringify(message);
+    if (!isPong && message.type !== "user_audio_chunk") {
+      console.log("[ElevenLabs] 📤 Sending:", payload.substring(0, 160));
+    }
+    this.ws.send(payload);
   }
 
-  confirmTurnEnded() {
-    if (!this.pendingTurnEnd) return;
-    console.log("[ElevenLabs] ✅ Turn end confirmed (queue drained)");
-    this.isAgentSpeaking = false;
-    this.hasReceivedAudio = false;
-    this.pendingTurnEnd = false;
+  resetAgentAudioTimeout() {
+    if (this.agentAudioTimeout) clearTimeout(this.agentAudioTimeout);
+    this.agentAudioTimeout = setTimeout(() => {
+      if (this.isAgentSpeaking) {
+        console.log("[ElevenLabs] ⏱️ Agent audio timeout - pending turn end (wait queue drain)");
+        this.onAgentStateChange?.(false, true); // pending
+      }
+    }, AGENT_AUDIO_TIMEOUT_MS);
   }
 
   close() {
@@ -471,9 +406,7 @@ class ElevenLabsClient {
   }
 }
 
-// ============================================================================
-// CALL SESSION
-// ============================================================================
+// -------------------- Call Session --------------------
 
 class CallSession {
   constructor(streamSid, twilioWs) {
@@ -484,16 +417,17 @@ class CallSession {
     this.vad = new SimpleVAD();
 
     this.isActive = true;
-
     this.agentSpeaking = false;
+
     this.waitingForGreeting = true;
 
-    this.audioSentCount = 0;
-
-    // Twilio playback queue
+    // Twilio output queue (mu-law bytes)
     this.outQueue = Buffer.alloc(0);
     this.playInterval = null;
     this.framesSent = 0;
+
+    // Stats
+    this.userChunksSent = 0;
 
     this.greetingTimeout = null;
     this.greetingFallbackTimeout = null;
@@ -502,36 +436,28 @@ class CallSession {
   }
 
   async start() {
-    try {
-      this.elevenLabs = new ElevenLabsClient(
-        ELEVENLABS_API_KEY,
-        ELEVENLABS_AGENT_ID,
-        (audioBase64) => this.handleElevenLabsAudio(audioBase64),
-        (error) => this.handleElevenLabsError(error),
-        (isSpeaking, isPending) => this.handleAgentStateChange(isSpeaking, isPending)
-      );
+    this.elevenLabs = new ElevenLabsClient(
+      ELEVENLABS_API_KEY,
+      ELEVENLABS_AGENT_ID,
+      (audioBase64) => this.handleElevenLabsAudio(audioBase64),
+      (isSpeaking, pending) => this.handleAgentStateChange(isSpeaking, pending)
+    );
 
-      await this.elevenLabs.connect();
-      console.log(`[Session ${this.streamSid}] ElevenLabs connected`);
+    await this.elevenLabs.connect();
+    console.log(`[Session ${this.streamSid}] ElevenLabs connected`);
 
-      this.startTwilioPlayer();
+    this.startTwilioPlayer();
 
-      // Trigger greeting after delay (only inside session)
-      this.greetingTimeout = setTimeout(() => {
-        if (this.isActive && this.elevenLabs?.isSessionReady) this.elevenLabs.triggerGreeting();
-      }, OUTBOUND_GREETING_DELAY_MS);
+    this.greetingTimeout = setTimeout(() => {
+      if (this.isActive && this.elevenLabs?.isSessionReady) this.elevenLabs.triggerGreeting();
+    }, OUTBOUND_GREETING_DELAY_MS);
 
-      // Fallback: if greeting never arrives, allow user audio
-      this.greetingFallbackTimeout = setTimeout(() => {
-        if (this.waitingForGreeting) {
-          console.log(`[Session ${this.streamSid}] ⚠️ Greeting timeout, enabling user audio anyway`);
-          this.waitingForGreeting = false;
-        }
-      }, GREETING_TIMEOUT_MS);
-    } catch (err) {
-      console.error(`[Session ${this.streamSid}] Failed to start:`, err);
-      this.close();
-    }
+    this.greetingFallbackTimeout = setTimeout(() => {
+      if (this.waitingForGreeting) {
+        console.log(`[Session ${this.streamSid}] ⚠️ Greeting timeout, enabling user audio anyway`);
+        this.waitingForGreeting = false;
+      }
+    }, GREETING_TIMEOUT_MS);
   }
 
   startTwilioPlayer() {
@@ -540,24 +466,17 @@ class CallSession {
     this.playInterval = setInterval(() => {
       if (!this.isActive) return;
       if (this.twilioWs.readyState !== WebSocket.OPEN) return;
-      if (this.outQueue.length < TWILIO_FRAME_BYTES) return;
+      if (this.outQueue.length < TWILIO_FRAME_SIZE) return;
 
-      const frame = this.outQueue.subarray(0, TWILIO_FRAME_BYTES);
-      this.outQueue = this.outQueue.subarray(TWILIO_FRAME_BYTES);
+      const frame = this.outQueue.subarray(0, TWILIO_FRAME_SIZE);
+      this.outQueue = this.outQueue.subarray(TWILIO_FRAME_SIZE);
 
-      this.twilioWs.send(
-        JSON.stringify({
-          event: "media",
-          streamSid: this.streamSid,
-          media: { payload: frame.toString("base64") },
-        })
-      );
-
+      const message = { event: "media", streamSid: this.streamSid, media: { payload: frame.toString("base64") } };
+      this.twilioWs.send(JSON.stringify(message));
       this.framesSent++;
+
       if (this.framesSent % 50 === 0) {
-        console.log(
-          `[Twilio ${this.streamSid.substring(0, 8)}] ▶️ Playing... frames=${this.framesSent}, queue=${this.outQueue.length} bytes`
-        );
+        console.log(`[Twilio ${this.streamSid.substring(0, 8)}] ▶️ Playing... frames=${this.framesSent}, queue=${this.outQueue.length} bytes`);
       }
     }, 20);
 
@@ -577,246 +496,19 @@ class CallSession {
     }
 
     if (isPending) {
-      // Agent stopped sending audio but Twilio may still be playing queued frames
+      // Wait for queue drain before allowing user
       this.startQueueDrainCheck();
       return;
     }
 
-    // Explicit end
+    // Definitive end
     this.agentSpeaking = false;
     console.log(`[Session ${this.streamSid}] Agent finished - ready for user input`);
     this.vad.resetForNewTurn();
   }
 
   startQueueDrainCheck() {
-    const interval = setInterval(() => {
-      if (!this.isActive) {
-        clearInterval(interval);
-        return;
-      }
-      // queue drained (<= 40ms)
-      if (this.outQueue.length < TWILIO_FRAME_BYTES * 2) {
-        clearInterval(interval);
-        this.agentSpeaking = false;
-        this.elevenLabs?.confirmTurnEnded();
-        console.log(`[Session ${this.streamSid}] Agent finished (queue drained) - ready for user input`);
-        this.vad.resetForNewTurn();
-      }
-    }, 100);
+    const checkInterval = setInterval(() => {
+      if (!this.isActive) return clearInterval(checkInterval);
 
-    // safety
-    setTimeout(() => clearInterval(interval), 5000);
-  }
-
-  processIncomingAudio(base64Mulaw) {
-    if (!this.isActive || !this.elevenLabs?.isConnected || !this.elevenLabs?.isSessionReady) return;
-
-    try {
-      const mulawBuffer = Buffer.from(base64Mulaw, "base64");
-      const pcm8k = decodeMulaw(mulawBuffer);
-
-      if (this.waitingForGreeting) return;
-
-      const energy = this.vad.calculateEnergy(pcm8k);
-
-      // While agent speaking: allow interruption only if loud/clear
-      if (this.agentSpeaking) {
-        if (energy > VAD_CONFIG.interruptionThreshold) {
-          console.log(`[Session ${this.streamSid}] 🛑 User interruption (energy: ${energy.toFixed(3)})`);
-          const pcm16k = upsample8to16(pcm8k);
-          const base64Pcm = pcm16ToBase64(pcm16k);
-          this.elevenLabs.sendAudio(base64Pcm);
-        }
-        return;
-      }
-
-      const vadResult = this.vad.processFrame(pcm8k, this.streamSid.substring(0, 8));
-
-      if (vadResult.isSpeech && this.vad.turnCommitted) {
-        console.log(`[Session ${this.streamSid}] New speech detected - resetting VAD`);
-        this.vad.resetForNewTurn();
-      }
-
-      if (vadResult.shouldSendAudio) {
-        const pcm16k = upsample8to16(pcm8k);
-        const base64Pcm = pcm16ToBase64(pcm16k);
-
-        if (this.elevenLabs.sendAudio(base64Pcm)) {
-          this.audioSentCount++;
-          this.vad.incrementAudioChunks();
-          if (this.audioSentCount % 100 === 0) {
-            console.log(`[Session ${this.streamSid}] Sent ${this.audioSentCount} audio chunks to ElevenLabs`);
-          }
-        }
-      }
-
-      if (vadResult.turnEnded) {
-        if (this.vad.hasEnoughAudioForCommit()) {
-          console.log(
-            `[Session ${this.streamSid}] ⚡ User turn ended (${vadResult.silenceMs}ms silence, ${this.vad.audioChunksSent} chunks)`
-          );
-          this.elevenLabs.endTurn();
-          this.agentSpeaking = true; // expect response
-        } else {
-          console.log(`[Session ${this.streamSid}] 🔇 Turn ended but not enough audio (${this.vad.audioChunksSent} chunks) - ignoring`);
-          this.vad.resetForNewTurn();
-        }
-      }
-    } catch (err) {
-      console.error(`[Session ${this.streamSid}] Audio processing error:`, err);
-    }
-  }
-
-  handleElevenLabsAudio(base64Pcm) {
-    if (!this.isActive) return;
-
-    try {
-      const pcm16k = base64ToPcm16(base64Pcm);
-      const pcm8k = downsample16to8(pcm16k);
-      const mulawBuffer = encodeMulaw(pcm8k);
-
-      this.enqueueToTwilio(mulawBuffer);
-    } catch (err) {
-      console.error(`[Session ${this.streamSid}] Audio transcode error:`, err);
-    }
-  }
-
-  handleElevenLabsError(err) {
-    console.error(`[Session ${this.streamSid}] ElevenLabs error:`, err);
-  }
-
-  close() {
-    console.log(
-      `[Session ${this.streamSid}] Closing - sent ${this.audioSentCount} user audio chunks, played ${this.framesSent} frames to Twilio`
-    );
-    this.isActive = false;
-
-    if (this.greetingTimeout) clearTimeout(this.greetingTimeout);
-    if (this.greetingFallbackTimeout) clearTimeout(this.greetingFallbackTimeout);
-    if (this.playInterval) clearInterval(this.playInterval);
-
-    this.elevenLabs?.close();
-  }
-}
-
-// ============================================================================
-// HTTP + WS SERVER (Twilio Media Streams)
-// ============================================================================
-
-const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }));
-    return;
-  }
-
-  if (req.url === "/twiml") {
-    const host = req.headers.host;
-    const wsUrl = `wss://${host}/twilio-stream`;
-
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Connect>
-    <Stream url="${wsUrl}">
-      <Parameter name="language" value="es-ES"/>
-    </Stream>
-  </Connect>
-</Response>`;
-
-    res.writeHead(200, { "Content-Type": "application/xml" });
-    res.end(twiml);
-    return;
-  }
-
-  res.writeHead(404);
-  res.end("Not found");
-});
-
-const wss = new WebSocket.Server({ server });
-const sessions = new Map();
-
-wss.on("connection", (ws, req) => {
-  console.log(`[Server] New WebSocket connection from ${req.url}`);
-
-  let session = null;
-
-  ws.on("message", async (data) => {
-    try {
-      const message = JSON.parse(data.toString());
-
-      switch (message.event) {
-        case "connected":
-          console.log("[Twilio] Connected event received");
-          break;
-
-        case "start": {
-          const streamSid = message.start.streamSid;
-          const callSid = message.start.callSid;
-          console.log(`[Twilio] 📞 Call started - StreamSid: ${streamSid}, CallSid: ${callSid}`);
-
-          session = new CallSession(streamSid, ws);
-          sessions.set(streamSid, session);
-          await session.start();
-          break;
-        }
-
-        case "media":
-          if (session) session.processIncomingAudio(message.media.payload);
-          break;
-
-        case "stop":
-          console.log("[Twilio] 📞 Call stopped");
-          if (session) {
-            session.close();
-            sessions.delete(session.streamSid);
-          }
-          break;
-
-        default:
-          break;
-      }
-    } catch (err) {
-      console.error("[Twilio] Message processing error:", err);
-    }
-  });
-
-  ws.on("close", (code) => {
-    console.log(`[Twilio] WebSocket closed: ${code}`);
-    if (session) {
-      session.close();
-      sessions.delete(session.streamSid);
-    }
-  });
-
-  ws.on("error", (err) => console.error("[Twilio] WebSocket error:", err));
-});
-
-// ============================================================================
-// START
-// ============================================================================
-
-server.listen(PORT, () => {
-  console.log(`
-╔════════════════════════════════════════════════════════════════╗
-║  Twilio ↔ ElevenLabs Real-Time Audio Bridge v3.1               ║
-╠════════════════════════════════════════════════════════════════╣
-║  Server running on port ${PORT}                                    ║
-║                                                                ║
-║  Endpoints:                                                    ║
-║    WebSocket: wss://your-domain/twilio-stream                  ║
-║    TwiML:     https://your-domain/twiml                        ║
-║    Health:    https://your-domain/health                       ║
-╚════════════════════════════════════════════════════════════════╝
-  `);
-
-  if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
-    console.warn("⚠️  Warning: ELEVENLABS_API_KEY or ELEVENLABS_AGENT_ID not set!");
-  }
-});
-
-process.on("SIGTERM", () => {
-  console.log("[Server] Shutting down...");
-  sessions.forEach((s) => s.close());
-  wss.close();
-  server.close();
-});
+      // queue nearly empty =>
