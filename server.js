@@ -416,11 +416,15 @@ class ElevenLabsClient {
         break;
 
       case 'ping':
-        console.log(`[ElevenLabs] 📨 Ping received, event_id: ${message.event_id || 'none'}`);
-        if (message.event_id) {
-          this.send({ type: 'pong', event_id: message.event_id });
+        // Log full ping structure to understand format
+        console.log(`[ElevenLabs] 📨 Ping received:`, JSON.stringify(message));
+        // Extract event_id from the correct location
+        const pingEventId = message.ping_event?.event_id || message.event_id;
+        if (pingEventId) {
+          this.send({ type: 'pong', event_id: pingEventId });
         } else {
-          this.send({ type: 'pong' });
+          // If no event_id, just send pong without it - but log warning
+          console.log('[ElevenLabs] ⚠️ Ping has no event_id, skipping pong');
         }
         break;
 
