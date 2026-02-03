@@ -55,7 +55,7 @@ function upsample8to16(samples) {
   const out = new Int16Array(samples.length * 2);
   for (let i = 0; i < samples.length; i++) {
     out[i * 2] = samples[i];
-    out[i * 2 + 1] = samples[i]; // zero-order hold, simple & stable
+    out[i * 2 + 1] = samples[i];
   }
   return out;
 }
@@ -139,7 +139,6 @@ class ElevenLabs {
 
   commit() {
     if (!this.ready) return;
-    // Compat: algunos agentes aceptan uno u otro
     this.ws.send(JSON.stringify({ type: "user_audio_commit" }));
     this.ws.send(JSON.stringify({ user_audio_commit: true }));
   }
@@ -162,23 +161,17 @@ class CallSession {
 
     this.eleven = null;
 
-    // Twilio playback buffer (mu-law bytes)
     this.outBuf = Buffer.alloc(0);
 
-    // Simple “silence commit” state
     this.lastVoiceAt = Date.now();
     this.userTalking = false;
 
-    // Tunables
-    this.SILENCE_MS_TO_COMMIT = 700;   // cuando te callas 700ms -> commit
-    this.ENERGY_THRESHOLD = 0.01;      // umbral para decir “hay voz”
-    this.MIN_AUDIO_BEFORE_COMMIT_MS = 250; // no commit por golpes/ruido
+    this.SILENCE_MS_TO_COMMIT = 700;
+    this.ENERGY_THRESHOLD = 0.01;
+    this.MIN_AUDIO_BEFORE_COMMIT_MS = 250;
     this.userSpeechStartAt = null;
 
-    // Player 20ms frames
     this.player = setInterval(() => this.playFrame(), 20);
-
-    // Commit watcher
     this.commitTimer = setInterval(() => this.maybeCommit(), 100);
 
     console.log(`[Session ${streamSid}] Created`);
@@ -209,7 +202,6 @@ class CallSession {
     const pcm8 = decodeMulaw(Buffer.from(b64, "base64"));
     const e = rmsEnergy(pcm8);
 
-    // Track “voice activity” very simply
     const now = Date.now();
     if (e > this.ENERGY_THRESHOLD) {
       this.lastVoiceAt = now;
@@ -219,7 +211,6 @@ class CallSession {
       }
     }
 
-    // Always forward audio to ElevenLabs (it will decide internally)
     const pcm16 = upsample8to16(pcm8);
     this.eleven.sendAudio(pcm16ToBase64(pcm16));
   }
@@ -243,4 +234,79 @@ class CallSession {
     const pcm16 = base64ToPcm16(b64);
     const pcm8 = downsample16to8(pcm16);
     const mulaw = encodeMulaw(pcm8);
-    this.outBuf = Buffer.concat([this.outBuf,]()
+    this.outBuf = Buffer.concat([this.outBuf, mulaw]);
+  }
+
+  close() {
+    console.log(`[Session ${this.streamSid}] Closing`);
+    clearInterval(this.player);
+    clearInterval(this.commitTimer);
+    this.eleven?.close();
+  }
+}
+
+/* ───────────────────── SERVER ───────────────────── */
+
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200).end("ok");
+    return;
+  }
+
+  if (req.url === "/twiml") {
+    const wsUrl = `wss://${req.headers.host}/twilio-stream`;
+    res.writeHead(200, { "Content-Type": "application/xml" });
+    res.end(`<?xml version="1.0"?>
+<Response>
+  <Connect>
+    <Stream url="${wsUrl}" />
+  </Connect>
+</Response>`);
+    return;
+  }
+
+  res.writeHead(404).end();
+});
+
+const wss = new WebSocket.Server({ server });
+
+wss.on("connection", (ws, req) => {
+  console.log(`[Server] New WebSocket connection from ${req.url}`);
+  let session = null;
+
+  ws.on("message", async (d) => {
+    const m = JSON.parse(d.toString());
+
+    if (m.event === "connected") {
+      console.log("[Twilio] Connected");
+    }
+
+    if (m.event === "start") {
+      const { streamSid, callSid } = m.start;
+      console.log(`[Twilio] 📞 start streamSid=${streamSid} callSid=${callSid}`);
+      session = new CallSession(streamSid, ws);
+      await session.start();
+    }
+
+    if (m.event === "media") {
+      session?.fromTwilio(m.media.payload);
+    }
+
+    if (m.event === "stop") {
+      console.log("[Twilio] 📞 stop");
+      session?.close();
+      session = null;
+    }
+  });
+
+  ws.on("close", () => {
+    session?.close();
+    session = null;
+  });
+});
+
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`   TwiML:  https://your-domain/twiml`);
+  console.log(`   Health: https://your-domain/health`);
+});
