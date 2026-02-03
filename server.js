@@ -1,5 +1,8 @@
 /**
- * Twilio ↔ ElevenLabs Real-Time Audio Bridge (stable)
+ * Twilio ↔ ElevenLabs Real-Time Audio Bridge (v5 - SILENCE FRAMES FIX)
+ *
+ * ✅ FIX: Always send frames to Twilio (silence when no agent audio)
+ *         This prevents Twilio from closing the connection due to inactivity
  *
  * Env:
  *  - ELEVENLABS_API_KEY
@@ -15,16 +18,18 @@ const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
 const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
 // -------------------- Audio constants --------------------
-const TWILIO_SAMPLE_RATE = 8000;          // Twilio Media Streams (mulaw @ 8k)
-const ELEVEN_SAMPLE_RATE = 16000;         // ElevenLabs expects PCM16 @ 16k
+const ELEVEN_SAMPLE_RATE = 16000;
 const TWILIO_FRAME_BYTES = 160;           // 20ms of 8kHz mu-law
 const PLAYER_INTERVAL_MS = 20;
 
+// ✅ Silence frame (mu-law 0xFF = silence)
+const MULAW_SILENCE_FRAME = Buffer.alloc(TWILIO_FRAME_BYTES, 0xff);
+
 // -------------------- VAD / Turn config --------------------
-const ENERGY_THRESHOLD = 0.02;            // telephony noise floor ~0.0002-0.0003
+const ENERGY_THRESHOLD = 0.02;
 const SILENCE_MS_TO_COMMIT = 800;
 const MIN_SPOKE_MS_TO_COMMIT = 400;
-const ANTI_ECHO_HOLD_MS = 800;
+const ANTI_ECHO_HOLD_MS = 600;
 
 // Greeting
 const GREETING_DELAY_MS = 700;
@@ -114,7 +119,6 @@ function rmsEnergy(pcm16) {
   return Math.sqrt(sum / pcm16.length);
 }
 
-// 100ms silence @ 16k
 function silence16kBase64(ms = 100) {
   const samples = Math.floor((ms / 1000) * ELEVEN_SAMPLE_RATE);
   const pcm = new Int16Array(samples);
@@ -155,7 +159,6 @@ class ElevenLabs {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch { return; }
 
-      // Ping/pong
       if (msg.type === "ping" || msg.ping_event) {
         const eid = msg.ping_event?.event_id ?? msg.event_id;
         if (eid && this.ws.readyState === WebSocket.OPEN) {
@@ -204,7 +207,6 @@ class ElevenLabs {
 
   sendAudio(b64Pcm16_16k) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) return;
-    // ✅ REQUIRED by ElevenLabs: include type
     this.ws.send(JSON.stringify({
       type: "user_audio_chunk",
       user_audio_chunk: b64Pcm16_16k,
@@ -218,7 +220,6 @@ class ElevenLabs {
 
   triggerGreeting() {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) return;
-    // a small silence chunk then commit triggers agent greeting
     this.sendAudio(silence16kBase64(120));
     this.commit();
   }
@@ -243,9 +244,9 @@ class CallSession {
     this.playTimer = null;
     this.frames = 0;
 
-    // Agent audio timing / anti-echo
+    // Anti-echo tracking
     this.lastAgentAudioAt = 0;
-    this.agentPlaying = false;
+    this.bufferEmptiedAt = 0;
 
     // VAD local
     this.userTalking = false;
@@ -279,13 +280,13 @@ class CallSession {
 
     this.startPlayer();
 
-    // greeting
     setTimeout(() => {
       if (!this.closed) this.eleven?.triggerGreeting();
     }, GREETING_DELAY_MS);
   }
 
   // ---- Twilio outbound player (20ms frames) ----
+  // ✅ FIX: ALWAYS send a frame (audio or silence) to keep connection alive
   startPlayer() {
     if (this.playTimer) return;
 
@@ -293,45 +294,54 @@ class CallSession {
       if (this.closed) return;
       if (this.twilioWs.readyState !== WebSocket.OPEN) return;
 
-      const now = Date.now();
+      let frame;
 
-      // ✅ clear “cola fantasma”
-      if (
-        this.outBuf.length > 0 &&
-        this.outBuf.length < TWILIO_FRAME_BYTES &&
-        (now - this.lastAgentAudioAt) > 300
-      ) {
-        this.outBuf = Buffer.alloc(0);
+      if (this.outBuf.length >= TWILIO_FRAME_BYTES) {
+        // Send agent audio
+        frame = this.outBuf.subarray(0, TWILIO_FRAME_BYTES);
+        this.outBuf = this.outBuf.subarray(TWILIO_FRAME_BYTES);
+
+        // Track when buffer becomes empty
+        if (this.outBuf.length < TWILIO_FRAME_BYTES) {
+          this.bufferEmptiedAt = Date.now();
+        }
+      } else {
+        // ✅ Send silence frame to keep Twilio alive
+        frame = MULAW_SILENCE_FRAME;
       }
 
-      if (this.outBuf.length < TWILIO_FRAME_BYTES) {
-        // agent “playing” for a short hold after last audio
-        this.agentPlaying = (now - this.lastAgentAudioAt) < 400;
-        return;
+      try {
+        this.twilioWs.send(JSON.stringify({
+          event: "media",
+          streamSid: this.streamSid,
+          media: { payload: frame.toString("base64") },
+        }));
+
+        this.frames++;
+        if (this.frames % 50 === 0) {
+          console.log(`[Twilio ${this.streamSid.slice(0, 8)}] ▶️ frames=${this.frames} queue=${this.outBuf.length}`);
+        }
+      } catch {
+        this.close("twilio_send_error");
       }
-
-      const frame = this.outBuf.subarray(0, TWILIO_FRAME_BYTES);
-      this.outBuf = this.outBuf.subarray(TWILIO_FRAME_BYTES);
-
-      this.twilioWs.send(JSON.stringify({
-        event: "media",
-        streamSid: this.streamSid,
-        media: { payload: frame.toString("base64") },
-      }));
-
-      this.frames++;
-      if (this.frames % 50 === 0) {
-        console.log(`[Twilio ${this.streamSid.slice(0, 8)}] ▶️ frames=${this.frames} queue=${this.outBuf.length}`);
-      }
-
-      // ✅ agent considered “playing” while queue has data or shortly after enqueue
-      this.agentPlaying = (this.outBuf.length > 0) || ((now - this.lastAgentAudioAt) < 400);
     }, PLAYER_INTERVAL_MS);
   }
 
-  enqueueToTwilio(mulawBuf) {
-    if (this.closed) return;
-    this.outBuf = Buffer.concat([this.outBuf, mulawBuf]);
+  // ✅ Check if agent is currently speaking (for anti-echo)
+  isAgentSpeaking() {
+    const now = Date.now();
+
+    // Agent speaking if buffer has audio
+    if (this.outBuf.length > 0) {
+      return true;
+    }
+
+    // Or if buffer just emptied recently
+    if (this.bufferEmptiedAt > 0 && (now - this.bufferEmptiedAt) < ANTI_ECHO_HOLD_MS) {
+      return true;
+    }
+
+    return false;
   }
 
   // ---- Receive Eleven audio (PCM16@16k base64) -> Twilio mulaw frames ----
@@ -344,7 +354,7 @@ class CallSession {
     const pcm8k = downsample16to8(pcm16k);
     const mulaw = encodeMulaw(pcm8k);
 
-    this.enqueueToTwilio(mulaw);
+    this.outBuf = Buffer.concat([this.outBuf, mulaw]);
   }
 
   // ---- Receive Twilio inbound audio (mulaw base64) -> Eleven PCM16@16k ----
@@ -353,12 +363,10 @@ class CallSession {
 
     const now = Date.now();
 
-    // ✅ robust anti-echo
-    const inAntiEcho =
-      (this.outBuf.length > 0) ||
-      (now - this.lastAgentAudioAt < ANTI_ECHO_HOLD_MS);
-
-    if (inAntiEcho) return;
+    // ✅ Anti-echo: don't process user audio while agent is speaking
+    if (this.isAgentSpeaking()) {
+      return;
+    }
 
     let pcm8;
     try {
@@ -379,7 +387,7 @@ class CallSession {
       }
     }
 
-    // ✅ always send audio to Eleven
+    // ✅ Always send audio to ElevenLabs (when not in anti-echo)
     const pcm16 = upsample8to16(pcm8);
     this.eleven.sendAudio(pcm16ToBase64(pcm16));
 
@@ -418,8 +426,6 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.url === "/twiml") {
-    // IMPORTANT: Twilio needs HTTPS URL here, and Stream needs WSS.
-    // host comes from req.headers.host (Railway gives *.up.railway.app)
     const host = req.headers.host;
     const wsUrl = `wss://${host}/twilio-stream`;
 
@@ -509,7 +515,6 @@ wss.on("connection", (ws, req) => {
   ws.on("error", () => {});
 });
 
-// Start
 server.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
   console.log(`   TwiML:  https://your-domain/twiml`);
@@ -520,7 +525,6 @@ server.listen(PORT, () => {
   }
 });
 
-// Graceful shutdown
 process.on("SIGTERM", () => {
   for (const s of sessions.values()) s.close("sigterm");
   try { wss.close(); } catch {}
