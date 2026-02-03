@@ -1,9 +1,7 @@
 /**
- * Twilio ↔ ElevenLabs Real-Time Audio Bridge (v6 - DEBUG)
+ * Twilio ↔ ElevenLabs Real-Time Audio Bridge (v7 - BUFFER FIX)
  *
- * ✅ Added detailed logging to debug ElevenLabs communication
- * ✅ Track audio chunks sent and commits
- * ✅ Log all ElevenLabs messages (including unknown types)
+ * ✅ FIX: Clear residual buffer bytes that are less than a full frame
  */
 
 const http = require("http");
@@ -132,9 +130,7 @@ class ElevenLabs {
 
     this.ws = null;
     this.ready = false;
-    this.open = false;
     
-    // ✅ DEBUG: Track messages
     this.audioChunksSent = 0;
     this.commitsSent = 0;
   }
@@ -149,84 +145,74 @@ class ElevenLabs {
     if (!res.ok) throw new Error(`ElevenLabs signed-url failed: ${await res.text()}`);
     const { signed_url } = await res.json();
 
-    this.ws = new WebSocket(signed_url);
+    return new Promise((resolve, reject) => {
+      this.ws = new WebSocket(signed_url);
 
-    this.ws.on("open", () => {
-      this.open = true;
-      this.log("WS open");
-    });
+      this.ws.on("open", () => {
+        this.log("WS open");
+      });
 
-    this.ws.on("message", (data) => {
-      let msg;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
+      this.ws.on("message", (data) => {
+        let msg;
+        try { msg = JSON.parse(data.toString()); } catch { return; }
 
-      // ✅ DEBUG: Log all message types
-      if (msg.type && !["ping", "audio"].includes(msg.type)) {
-        this.log(`📨 Received: ${msg.type}`);
-      }
-
-      if (msg.type === "ping" || msg.ping_event) {
-        const eid = msg.ping_event?.event_id ?? msg.event_id;
-        if (eid && this.ws.readyState === WebSocket.OPEN) {
-          this.ws.send(JSON.stringify({ type: "pong", event_id: eid }));
+        if (msg.type === "ping" || msg.ping_event) {
+          const eid = msg.ping_event?.event_id ?? msg.event_id;
+          if (eid && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({ type: "pong", event_id: eid }));
+          }
+          return;
         }
-        return;
-      }
 
-      if (msg.type === "conversation_initiation_metadata") {
-        this.ready = true;
-        this.log("✅ ready");
-        this.onReady?.();
-        return;
-      }
+        if (msg.type === "conversation_initiation_metadata") {
+          this.ready = true;
+          this.log("✅ ready");
+          this.onReady?.();
+          resolve();
+          return;
+        }
 
-      if (msg.type === "audio") {
-        const b64 =
-          msg.audio_event?.audio_base_64 ||
-          msg.audio?.chunk ||
-          msg.audio?.audio_base_64 ||
-          msg.audio_event?.chunk;
-        if (b64) this.onAudio?.(b64);
-        return;
-      }
+        if (msg.type === "audio") {
+          const b64 =
+            msg.audio_event?.audio_base_64 ||
+            msg.audio?.chunk ||
+            msg.audio?.audio_base_64 ||
+            msg.audio_event?.chunk;
+          if (b64) this.onAudio?.(b64);
+          return;
+        }
 
-      if (msg.type === "agent_response") {
-        const text = msg.agent_response_event?.agent_response;
-        if (text) this.onAgentText?.(text);
-        return;
-      }
+        if (msg.type === "agent_response") {
+          const text = msg.agent_response_event?.agent_response;
+          if (text) this.onAgentText?.(text);
+          return;
+        }
 
-      if (msg.type === "user_transcript") {
-        const text = msg.user_transcription_event?.user_transcript;
-        if (text) this.onUserText?.(text);
-        return;
-      }
+        if (msg.type === "user_transcript") {
+          const text = msg.user_transcription_event?.user_transcript;
+          if (text) this.onUserText?.(text);
+          return;
+        }
+      });
 
-      // ✅ DEBUG: Log unknown message types
-      if (msg.type) {
-        this.log(`⚠️ Unknown message type: ${msg.type}`);
-      }
-    });
+      this.ws.on("close", (code, reason) => {
+        this.ready = false;
+        this.log(`WS close code=${code} reason=${reason?.toString?.() || ""}`);
+        this.onClose?.(code, reason?.toString?.() || "");
+      });
 
-    this.ws.on("close", (code, reason) => {
-      this.open = false;
-      this.ready = false;
-      this.log(`WS close code=${code} reason=${reason?.toString?.() || ""}`);
-      this.onClose?.(code, reason?.toString?.() || "");
-    });
+      this.ws.on("error", (err) => {
+        this.log(`WS error: ${err?.message || err}`);
+        reject(err);
+      });
 
-    this.ws.on("error", (err) => {
-      this.log(`WS error: ${err?.message || err}`);
+      // Timeout
+      setTimeout(() => resolve(), 8000);
     });
   }
 
   sendAudio(b64Pcm16_16k) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.log(`⚠️ Cannot send audio: WS not open (state=${this.ws?.readyState})`);
-      return false;
-    }
-    if (!this.ready) {
-      this.log(`⚠️ Cannot send audio: not ready`);
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) {
       return false;
     }
     
@@ -244,11 +230,7 @@ class ElevenLabs {
   }
 
   commit() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      this.log(`⚠️ Cannot commit: WS not open (state=${this.ws?.readyState})`);
-      return false;
-    }
-    if (!this.ready) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) {
       this.log(`⚠️ Cannot commit: not ready`);
       return false;
     }
@@ -256,7 +238,7 @@ class ElevenLabs {
     try {
       this.ws.send(JSON.stringify({ type: "user_audio_commit" }));
       this.commitsSent++;
-      this.log(`📤 Commit #${this.commitsSent} sent (${this.audioChunksSent} audio chunks total)`);
+      this.log(`📤 Commit #${this.commitsSent} (${this.audioChunksSent} chunks total)`);
       return true;
     } catch (err) {
       this.log(`❌ commit error: ${err?.message || err}`);
@@ -265,10 +247,7 @@ class ElevenLabs {
   }
 
   triggerGreeting() {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.ready) {
-      this.log("⚠️ Cannot trigger greeting: not ready");
-      return false;
-    }
+    if (!this.ready) return false;
     this.log("🎬 Triggering greeting...");
     this.sendAudio(silence16kBase64(120));
     return this.commit();
@@ -300,8 +279,6 @@ class CallSession {
     this.userTalking = false;
     this.userSpeechStartAt = 0;
     this.lastVoiceAt = 0;
-    
-    // ✅ DEBUG: Track user audio chunks
     this.userAudioChunks = 0;
 
     this.eleven = null;
@@ -324,7 +301,7 @@ class CallSession {
       onAudio: (b64) => this.onElevenAudio(b64),
       onAgentText: (t) => console.log(`[Session ${this.shortId}] [ElevenLabs] 💬 Agent: ${t.substring(0, 90)}`),
       onUserText: (t) => console.log(`[Session ${this.shortId}] [ElevenLabs] 👤 User: ${t}`),
-      onClose: (c, r) => {},
+      onClose: () => {},
     });
 
     await this.eleven.connect();
@@ -333,7 +310,9 @@ class CallSession {
     this.startPlayer();
 
     setTimeout(() => {
-      if (!this.closed) this.eleven?.triggerGreeting();
+      if (!this.closed && this.eleven?.ready) {
+        this.eleven.triggerGreeting();
+      }
     }, GREETING_DELAY_MS);
   }
 
@@ -344,14 +323,24 @@ class CallSession {
       if (this.closed) return;
       if (this.twilioWs.readyState !== WebSocket.OPEN) return;
 
+      const now = Date.now();
       let frame;
+
+      // ✅ FIX: Clear residual buffer if it's less than a full frame
+      // and no new audio has arrived recently
+      if (this.outBuf.length > 0 && 
+          this.outBuf.length < TWILIO_FRAME_BYTES && 
+          (now - this.lastAgentAudioAt) > 200) {
+        this.outBuf = Buffer.alloc(0);
+        this.bufferEmptiedAt = now;
+      }
 
       if (this.outBuf.length >= TWILIO_FRAME_BYTES) {
         frame = this.outBuf.subarray(0, TWILIO_FRAME_BYTES);
         this.outBuf = this.outBuf.subarray(TWILIO_FRAME_BYTES);
 
         if (this.outBuf.length < TWILIO_FRAME_BYTES) {
-          this.bufferEmptiedAt = Date.now();
+          this.bufferEmptiedAt = now;
         }
       } else {
         frame = MULAW_SILENCE_FRAME;
@@ -376,8 +365,17 @@ class CallSession {
 
   isAgentSpeaking() {
     const now = Date.now();
-    if (this.outBuf.length > 0) return true;
-    if (this.bufferEmptiedAt > 0 && (now - this.bufferEmptiedAt) < ANTI_ECHO_HOLD_MS) return true;
+
+    // Agent speaking if buffer has a full frame of audio
+    if (this.outBuf.length >= TWILIO_FRAME_BYTES) {
+      return true;
+    }
+
+    // Or if buffer just emptied recently
+    if (this.bufferEmptiedAt > 0 && (now - this.bufferEmptiedAt) < ANTI_ECHO_HOLD_MS) {
+      return true;
+    }
+
     return false;
   }
 
@@ -394,7 +392,7 @@ class CallSession {
   }
 
   fromTwilio(b64Mulaw) {
-    if (this.closed || !this.eleven) return;
+    if (this.closed || !this.eleven || !this.eleven.ready) return;
 
     const now = Date.now();
 
@@ -420,7 +418,7 @@ class CallSession {
       }
     }
 
-    // ✅ Always send audio to ElevenLabs
+    // Always send audio to ElevenLabs
     const pcm16 = upsample8to16(pcm8);
     const sent = this.eleven.sendAudio(pcm16ToBase64(pcm16));
     if (sent) {
