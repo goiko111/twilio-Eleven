@@ -291,6 +291,7 @@ class ElevenLabsClient {
     this.turnCommitTime = null;
     this.greetingTriggered = false;
     this.agentAudioTimeout = null; // Timeout to detect when agent stops speaking
+  }
 
   async connect() {
     return new Promise(async (resolve, reject) => {
