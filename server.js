@@ -11,6 +11,13 @@
 const http = require("http");
 const WebSocket = require("ws");
 
+const PORT = process.env.PORT || 8080;
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
+const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
+
+if (!ELEVENLABS_API_KEY || !ELEVENLABS_AGENT_ID) {
+  console.warn("⚠️ Missing ELEVENLABS_API_KEY or ELEVENLABS_AGENT_ID");
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Audio constants
