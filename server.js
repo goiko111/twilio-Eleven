@@ -358,13 +358,24 @@ class ElevenLabsClient {
   }
 
   handleMessage(message) {
+    // Log ALL messages for debugging
+    if (message.type !== 'ping') {
+      console.log(`[ElevenLabs] 📨 Event type: ${message.type}`, JSON.stringify(message).substring(0, 200));
+    }
+    
     switch (message.type) {
       case 'audio':
-        if (message.audio?.chunk) {
+        // Try multiple possible audio formats
+        const audioChunk = message.audio?.chunk || 
+                          message.audio_event?.audio_base_64 ||
+                          message.audio_event?.chunk ||
+                          message.audio?.audio_base_64;
+        
+        if (audioChunk) {
           if (!this.hasReceivedAudio) {
             this.hasReceivedAudio = true;
             const latency = this.turnCommitTime ? Date.now() - this.turnCommitTime : 0;
-            console.log(`[ElevenLabs] 🔊 First audio chunk received (latency: ${latency}ms)`);
+            console.log(`[ElevenLabs] 🔊 First audio chunk received (latency: ${latency}ms, size: ${audioChunk.length})`);
           }
           
           if (!this.isAgentSpeaking) {
@@ -372,7 +383,9 @@ class ElevenLabsClient {
             console.log('[ElevenLabs] 🎙️ Agent started speaking');
             this.onAgentStateChange?.(true);
           }
-          this.onAudio(message.audio.chunk);
+          this.onAudio(audioChunk);
+        } else {
+          console.log('[ElevenLabs] ⚠️ Audio event but no chunk found:', JSON.stringify(message).substring(0, 300));
         }
         break;
 
@@ -407,13 +420,11 @@ class ElevenLabsClient {
         break;
 
       case 'conversation_initiation_metadata':
-        console.log('[ElevenLabs] Session initialized');
+        console.log('[ElevenLabs] Session initialized, config:', JSON.stringify(message.conversation_initiation_metadata_event || {}).substring(0, 200));
         break;
 
       default:
-        if (message.type) {
-          console.log(`[ElevenLabs] Event: ${message.type}`);
-        }
+        console.log(`[ElevenLabs] Unknown event: ${message.type}`);
         break;
     }
   }
