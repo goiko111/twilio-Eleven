@@ -26,10 +26,11 @@ const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 // VAD Configuration - AGGRESSIVE turn detection for fast response
 const VAD_CONFIG = {
   silenceThresholdMs: 420,      // End turn after 420ms silence - no waiting!
-  energyThreshold: 0.008,       // Lower threshold for telephony noise floor
+  energyThreshold: 0.015,       // Higher threshold for telephony noise floor
   frameSize: 160,               // Samples per frame (20ms at 8kHz)
-  minSpeechFrames: 2,           // Minimum frames to confirm speech (40ms)
+  minSpeechFrames: 3,           // Minimum frames to confirm speech (60ms)
   maxSilenceBeforeGate: 300,    // Stop sending audio after 300ms silence (pre-commit)
+  interruptionThreshold: 0.05,  // Much higher threshold for interruption detection
 };
 
 // Audio Configuration
@@ -162,8 +163,8 @@ class SimpleVAD {
     this.silentFrames = 0;
     this.speechFrames = 0;
     this.isSpeaking = false;
-    this.turnCommitted = false;  // Track if we already sent end-of-turn
-    this.audioGated = false;     // Track if we should stop sending audio
+    this.turnCommitted = false;
+    this.audioGated = false;
   }
 
   /**
@@ -180,16 +181,13 @@ class SimpleVAD {
 
   /**
    * Process audio frame and return turn detection result
-   * AGGRESSIVE: Stops audio early, commits turn immediately at threshold
-   * @returns {{ isSpeech: boolean, turnEnded: boolean, shouldSendAudio: boolean, silenceMs: number }}
    */
   processFrame(samples) {
-    // Already committed this turn - don't send more audio
     if (this.turnCommitted) {
       return {
         isSpeech: false,
         turnEnded: false,
-        shouldSendAudio: false,  // STOP sending audio
+        shouldSendAudio: false,
         silenceMs: 999
       };
     }
@@ -200,7 +198,7 @@ class SimpleVAD {
     if (isSpeech) {
       this.speechFrames++;
       this.silentFrames = 0;
-      this.audioGated = false;  // Resume sending audio
+      this.audioGated = false;
       
       if (this.speechFrames >= this.config.minSpeechFrames) {
         this.isSpeaking = true;
@@ -214,52 +212,41 @@ class SimpleVAD {
       };
     }
     
-    // Silence detected
     this.silentFrames++;
     const silenceMs = (this.silentFrames * this.config.frameSize / 8000) * 1000;
 
-    // Only process silence if we've been speaking
     if (!this.isSpeaking) {
       return {
         isSpeech: false,
         turnEnded: false,
-        shouldSendAudio: false,  // Don't send pre-speech silence
+        shouldSendAudio: false,
         silenceMs: 0
       };
     }
 
-    // AGGRESSIVE: Gate audio early (before commit threshold)
     if (silenceMs >= this.config.maxSilenceBeforeGate) {
       this.audioGated = true;
     }
 
-    // Check if we hit the turn-end threshold
     if (silenceMs >= this.config.silenceThresholdMs) {
-      // IMMEDIATELY commit turn - no more waiting
       this.turnCommitted = true;
       
-      const result = {
+      return {
         isSpeech: false,
         turnEnded: true,
         shouldSendAudio: false,
         silenceMs
       };
-      
-      // DON'T reset yet - keep blocking audio until new speech
-      return result;
     }
 
     return {
       isSpeech: false,
       turnEnded: false,
-      shouldSendAudio: !this.audioGated,  // Stop sending if gated
+      shouldSendAudio: !this.audioGated,
       silenceMs
     };
   }
 
-  /**
-   * Call when new speech is detected to reset for next turn
-   */
   resetForNewTurn() {
     this.silentFrames = 0;
     this.speechFrames = 0;
@@ -279,19 +266,20 @@ class ElevenLabsClient {
     this.agentId = agentId;
     this.onAudio = onAudio;
     this.onError = onError;
-    this.onAgentStateChange = onAgentStateChange;  // Callback for agent speaking state
+    this.onAgentStateChange = onAgentStateChange;
     this.ws = null;
     this.isConnected = false;
+    this.isSessionReady = false;  // NEW: Track if session is fully established
     this.reconnectAttempts = 0;
-    this.maxReconnects = 1;
+    this.maxReconnects = 3;
     this.isAgentSpeaking = false;
-    this.turnCommitTime = null;  // Track when we sent commit
+    this.hasReceivedAudio = false;  // NEW: Track if agent has started sending audio
+    this.turnCommitTime = null;
   }
 
   async connect() {
     return new Promise(async (resolve, reject) => {
       try {
-        // Get signed URL for WebSocket connection
         const response = await fetch(
           `https://api.elevenlabs.io/v1/convai/conversation/get-signed-url?agent_id=${this.agentId}`,
           {
@@ -313,13 +301,20 @@ class ElevenLabsClient {
           console.log('[ElevenLabs] WebSocket connected');
           this.isConnected = true;
           this.reconnectAttempts = 0;
-          resolve();
+          // Don't resolve yet - wait for conversation_initiation_metadata
         });
 
         this.ws.on('message', (data) => {
           try {
             const message = JSON.parse(data.toString());
             this.handleMessage(message);
+            
+            // Resolve promise when session is ready
+            if (message.type === 'conversation_initiation_metadata' && !this.isSessionReady) {
+              this.isSessionReady = true;
+              console.log('[ElevenLabs] Session fully established - ready to receive audio');
+              resolve();
+            }
           } catch (e) {
             console.error('[ElevenLabs] Failed to parse message:', e);
           }
@@ -328,11 +323,13 @@ class ElevenLabsClient {
         this.ws.on('close', (code, reason) => {
           console.log(`[ElevenLabs] WebSocket closed: ${code} - ${reason}`);
           this.isConnected = false;
+          this.isSessionReady = false;
+          this.hasReceivedAudio = false;
           
           if (this.reconnectAttempts < this.maxReconnects) {
             this.reconnectAttempts++;
             console.log(`[ElevenLabs] Attempting reconnect ${this.reconnectAttempts}/${this.maxReconnects}`);
-            setTimeout(() => this.connect(), 1000);
+            setTimeout(() => this.connect(), 500);
           }
         });
 
@@ -341,6 +338,14 @@ class ElevenLabsClient {
           this.onError?.(error);
           reject(error);
         });
+
+        // Timeout for initial connection
+        setTimeout(() => {
+          if (!this.isSessionReady) {
+            console.log('[ElevenLabs] Connection timeout - resolving anyway');
+            resolve();
+          }
+        }, 5000);
 
       } catch (error) {
         console.error('[ElevenLabs] Connection error:', error);
@@ -352,13 +357,16 @@ class ElevenLabsClient {
   handleMessage(message) {
     switch (message.type) {
       case 'audio':
-        // ElevenLabs sends audio as base64 PCM16 at 16kHz
         if (message.audio?.chunk) {
-          // Agent is speaking
+          // Mark that we've received audio - now interruption is valid
+          if (!this.hasReceivedAudio) {
+            this.hasReceivedAudio = true;
+            const latency = this.turnCommitTime ? Date.now() - this.turnCommitTime : 0;
+            console.log(`[ElevenLabs] ⚡ First audio received (latency: ${latency}ms)`);
+          }
+          
           if (!this.isAgentSpeaking) {
             this.isAgentSpeaking = true;
-            const latency = this.turnCommitTime ? Date.now() - this.turnCommitTime : 0;
-            console.log(`[ElevenLabs] ⚡ Agent started speaking (latency: ${latency}ms)`);
             this.onAgentStateChange?.(true);
           }
           this.onAudio(message.audio.chunk);
@@ -367,16 +375,10 @@ class ElevenLabsClient {
 
       case 'agent_response':
         console.log('[ElevenLabs] Agent response:', message.agent_response_event?.agent_response?.substring(0, 50));
-        // CRITICAL: Set speaking flag IMMEDIATELY when agent starts responding
-        // This prevents VAD from sending commit while agent is about to speak
-        if (!this.isAgentSpeaking) {
-          this.isAgentSpeaking = true;
-          this.onAgentStateChange?.(true);
-        }
+        // Don't set speaking flag here - wait for actual audio
         break;
 
       case 'agent_response_correction':
-        // Agent was interrupted
         console.log('[ElevenLabs] Agent corrected (interrupted)');
         break;
 
@@ -387,13 +389,14 @@ class ElevenLabsClient {
       case 'interruption':
         console.log('[ElevenLabs] Interrupted - stopping agent audio');
         this.isAgentSpeaking = false;
+        this.hasReceivedAudio = false;
         this.onAgentStateChange?.(false);
         break;
 
       case 'turn_end':
-        // Agent finished speaking
         console.log('[ElevenLabs] Agent turn ended');
         this.isAgentSpeaking = false;
+        this.hasReceivedAudio = false;
         this.onAgentStateChange?.(false);
         break;
 
@@ -401,8 +404,11 @@ class ElevenLabsClient {
         this.send({ type: 'pong', event_id: message.event_id });
         break;
 
+      case 'conversation_initiation_metadata':
+        console.log('[ElevenLabs] Session initialized');
+        break;
+
       default:
-        // Log unknown message types for debugging
         if (message.type) {
           console.log(`[ElevenLabs] Event: ${message.type}`);
         }
@@ -412,27 +418,33 @@ class ElevenLabsClient {
 
   /**
    * Send audio chunk to ElevenLabs
-   * @param {string} base64Audio - Base64 encoded PCM16 audio at 16kHz
+   * ONLY call this when session is ready
    */
   sendAudio(base64Audio) {
-    if (!this.isConnected) return;
+    if (!this.isConnected || !this.isSessionReady) {
+      return false;
+    }
     
     this.send({
       type: 'user_audio_chunk',
       user_audio_chunk: base64Audio
     });
+    return true;
   }
 
   /**
-   * Signal end of user turn - CALL THIS IMMEDIATELY at silence threshold
+   * Check if agent is actually playing audio (not just preparing)
    */
+  isPlayingAudio() {
+    return this.isAgentSpeaking && this.hasReceivedAudio;
+  }
+
   endTurn() {
-    if (!this.isConnected) return;
+    if (!this.isConnected || !this.isSessionReady) return;
     
     this.turnCommitTime = Date.now();
-    console.log('[ElevenLabs] ⚡ Sending user_audio_commit NOW');
+    console.log('[ElevenLabs] ⚡ Sending user_audio_commit');
     
-    // Send commit signal to trigger agent response immediately
     this.send({
       type: 'user_audio_commit'
     });
@@ -445,7 +457,7 @@ class ElevenLabsClient {
   }
 
   close() {
-    this.maxReconnects = 0; // Prevent reconnection
+    this.maxReconnects = 0;
     this.ws?.close();
   }
 }
@@ -461,15 +473,14 @@ class CallSession {
     this.elevenLabs = null;
     this.vad = new SimpleVAD();
     this.isActive = true;
-    this.agentSpeaking = false;  // Track when agent is responding
-    this.pendingAudioBuffer = []; // Buffer audio during agent speech
+    this.agentSpeaking = false;
+    this.audioSentCount = 0;  // Track how many audio chunks sent
     
-    console.log(`[Session ${streamSid}] Created - AGGRESSIVE turn detection enabled`);
+    console.log(`[Session ${streamSid}] Created`);
   }
 
   async start() {
     try {
-      // Connect to ElevenLabs with agent state callback
       this.elevenLabs = new ElevenLabsClient(
         ELEVENLABS_API_KEY,
         ELEVENLABS_AGENT_ID,
@@ -487,13 +498,9 @@ class CallSession {
     }
   }
 
-  /**
-   * Handle agent speaking state changes
-   */
   handleAgentStateChange(isSpeaking) {
     this.agentSpeaking = isSpeaking;
     if (!isSpeaking) {
-      // Agent finished speaking - ready for next user turn
       console.log(`[Session ${this.streamSid}] Agent finished - ready for user`);
       this.vad.resetForNewTurn();
     }
@@ -501,60 +508,53 @@ class CallSession {
 
   /**
    * Process incoming Twilio audio
-   * AGGRESSIVE: Immediately stops audio and commits turn at silence threshold
-   * @param {string} base64Mulaw - Base64 encoded mu-law audio at 8kHz
    */
   processIncomingAudio(base64Mulaw) {
     if (!this.isActive || !this.elevenLabs?.isConnected) return;
+    if (!this.elevenLabs?.isSessionReady) return;  // Don't send until session ready
 
     try {
-      // Decode base64 to mu-law bytes
       const mulawBuffer = Buffer.from(base64Mulaw, 'base64');
-      
-      // Decode mu-law to PCM16
       const pcm8k = decodeMulaw(mulawBuffer);
       
-      // CRITICAL: Skip VAD processing while agent is speaking
-      // We still send audio for potential interruption detection by ElevenLabs
-      if (this.agentSpeaking) {
-        // Check for user interruption (high energy = user speaking over agent)
+      // While agent is ACTUALLY playing audio, check for loud interruption only
+      if (this.elevenLabs.isPlayingAudio()) {
         const energy = this.vad.calculateEnergy(pcm8k);
-        if (energy > VAD_CONFIG.energyThreshold * 2) { // Higher threshold for interruption
-          console.log(`[Session ${this.streamSid}] User interruption detected during agent speech`);
-          // Just send the audio - ElevenLabs will handle the interruption
+        
+        // Much higher threshold for interruption - only clear speech
+        if (energy > VAD_CONFIG.interruptionThreshold) {
+          console.log(`[Session ${this.streamSid}] User interruption (energy: ${energy.toFixed(3)})`);
           const pcm16k = upsample8to16(pcm8k);
           const base64Pcm = pcm16ToBase64(pcm16k);
           this.elevenLabs.sendAudio(base64Pcm);
         }
-        return; // Don't process VAD turn detection while agent speaks
+        return;
       }
       
-      // Run VAD on 8kHz audio - this decides if we should send audio
+      // Normal VAD processing when agent is not speaking
       const vadResult = this.vad.processFrame(pcm8k);
       
-      // If new speech detected after a committed turn, reset VAD
       if (vadResult.isSpeech && this.vad.turnCommitted) {
-        console.log(`[Session ${this.streamSid}] New speech detected - resetting for new turn`);
+        console.log(`[Session ${this.streamSid}] New speech detected - resetting`);
         this.vad.resetForNewTurn();
       }
       
-      // CRITICAL: Only send audio if VAD says so
       if (vadResult.shouldSendAudio) {
-        // Upsample to 16kHz for ElevenLabs
         const pcm16k = upsample8to16(pcm8k);
-        
-        // Convert to base64 and send to ElevenLabs
         const base64Pcm = pcm16ToBase64(pcm16k);
-        this.elevenLabs.sendAudio(base64Pcm);
+        
+        if (this.elevenLabs.sendAudio(base64Pcm)) {
+          this.audioSentCount++;
+          if (this.audioSentCount % 50 === 0) {
+            console.log(`[Session ${this.streamSid}] Sent ${this.audioSentCount} audio chunks`);
+          }
+        }
       }
 
-      // AGGRESSIVE: Check if turn ended - signal IMMEDIATELY
       if (vadResult.turnEnded) {
-        console.log(`[Session ${this.streamSid}] ⚡ TURN ENDED at ${vadResult.silenceMs}ms - sending commit NOW`);
-        
-        // Send end-of-turn signal immediately - no more waiting
+        console.log(`[Session ${this.streamSid}] ⚡ TURN ENDED at ${vadResult.silenceMs}ms`);
         this.elevenLabs.endTurn();
-        this.agentSpeaking = true;  // Expect agent response
+        this.agentSpeaking = true;
       }
 
     } catch (error) {
@@ -564,22 +564,15 @@ class CallSession {
 
   /**
    * Handle audio coming from ElevenLabs
-   * @param {string} base64Pcm - Base64 encoded PCM16 audio at 16kHz
    */
   handleElevenLabsAudio(base64Pcm) {
     if (!this.isActive) return;
 
     try {
-      // Decode base64 to PCM16 samples
       const pcm16k = base64ToPcm16(base64Pcm);
-      
-      // Downsample to 8kHz
       const pcm8k = downsample16to8(pcm16k);
-      
-      // Encode to mu-law
       const mulawBuffer = encodeMulaw(pcm8k);
       
-      // Send to Twilio
       this.sendToTwilio(mulawBuffer.toString('base64'));
 
     } catch (error) {
@@ -589,13 +582,8 @@ class CallSession {
 
   handleElevenLabsError(error) {
     console.error(`[Session ${this.streamSid}] ElevenLabs error:`, error);
-    // Could send fallback TTS or close gracefully
   }
 
-  /**
-   * Send audio back to Twilio
-   * @param {string} base64Mulaw - Base64 encoded mu-law audio
-   */
   sendToTwilio(base64Mulaw) {
     if (this.twilioWs.readyState !== WebSocket.OPEN) return;
 
@@ -611,7 +599,7 @@ class CallSession {
   }
 
   close() {
-    console.log(`[Session ${this.streamSid}] Closing`);
+    console.log(`[Session ${this.streamSid}] Closing - sent ${this.audioSentCount} audio chunks`);
     this.isActive = false;
     this.elevenLabs?.close();
   }
@@ -622,14 +610,12 @@ class CallSession {
 // ============================================================================
 
 const server = http.createServer((req, res) => {
-  // Health check endpoint
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
     return;
   }
 
-  // TwiML endpoint for initiating calls
   if (req.url === '/twiml') {
     const host = req.headers.host;
     const wsUrl = `wss://${host}/twilio-stream`;
@@ -654,7 +640,6 @@ const server = http.createServer((req, res) => {
 
 const wss = new WebSocket.Server({ server });
 
-// Track active sessions
 const sessions = new Map();
 
 wss.on('connection', (ws, req) => {
@@ -672,7 +657,6 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'start':
-          // New call started
           const streamSid = message.start.streamSid;
           const callSid = message.start.callSid;
           console.log(`[Twilio] Call started - StreamSid: ${streamSid}, CallSid: ${callSid}`);
@@ -683,14 +667,12 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'media':
-          // Incoming audio from caller
           if (session) {
             session.processIncomingAudio(message.media.payload);
           }
           break;
 
         case 'stop':
-          // Call ended
           console.log('[Twilio] Call stopped');
           if (session) {
             session.close();
@@ -699,7 +681,6 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'mark':
-          // Audio mark event (can be used for synchronization)
           break;
 
         default:
@@ -747,7 +728,6 @@ server.listen(PORT, () => {
   }
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('[Server] Shutting down...');
   sessions.forEach(session => session.close());
