@@ -1,10 +1,6 @@
 /**
  * Twilio ↔ ElevenLabs Real-Time Audio Bridge v3.2 (NO-BARGE-IN, anti-echo gate)
- *
- * Fixes:
- * - Disables interruption/barge-in (echo was triggering infinite "interruptions")
- * - Ignores inbound audio while agent is speaking OR while Twilio outQueue still has audio
- * - Uses ElevenLabs message format that matches your working logs: {type:'user_audio_chunk', user_audio_chunk:...}
+ * Last line MUST be: // EOF
  */
 
 const WebSocket = require("ws");
@@ -16,35 +12,31 @@ const ELEVENLABS_AGENT_ID = process.env.ELEVENLABS_AGENT_ID;
 
 // -------------------- VAD (telephony) --------------------
 const VAD_CONFIG = {
-  silenceThresholdMs: 800,     // end turn after 800ms silence
-  energyThreshold: 0.02,       // based on your measured speech/noise
-  frameSize: 160,              // 20ms @ 8kHz
-  minSpeechFrames: 4,          // 80ms
-  maxSilenceBeforeGate: 500,   // stop sending after 500ms silence (pre-commit)
-  minAudioChunksForCommit: 20, // require at least ~400ms of chunks to commit
+  silenceThresholdMs: 800,
+  energyThreshold: 0.02,
+  frameSize: 160,
+  minSpeechFrames: 4,
+  maxSilenceBeforeGate: 500,
+  minAudioChunksForCommit: 20,
 };
 
-const LOG_ENERGY_EVERY_N_FRAMES = 50; // ~1s
+const LOG_ENERGY_EVERY_N_FRAMES = 50;
 const ELEVENLABS_SAMPLE_RATE = 16000;
-const TWILIO_FRAME_SIZE = 160; // 20ms of G.711 mu-law bytes @8kHz
+const TWILIO_FRAME_SIZE = 160;
 
-// Agent speaking timeout (only to help state; real gate is queue-drain)
 const AGENT_AUDIO_TIMEOUT_MS = 1500;
 
-// Greeting timing
 const OUTBOUND_GREETING_DELAY_MS = 600;
 const GREETING_TIMEOUT_MS = 2500;
 
 // -------------------- AUDIO UTILS --------------------
-
-// Mu-law decode table
 const MULAW_DECODE_TABLE = new Int16Array(256);
 (function initMulawTable() {
   for (let i = 0; i < 256; i++) {
     let mulaw = ~i;
-    let sign = (mulaw & 0x80) ? -1 : 1;
+    let sign = mulaw & 0x80 ? -1 : 1;
     let exponent = (mulaw >> 4) & 0x07;
-    let mantissa = mulaw & 0x0F;
+    let mantissa = mulaw & 0x0f;
     let sample = (mantissa << 3) + 0x84;
     sample <<= exponent;
     sample -= 0x84;
@@ -53,7 +45,7 @@ const MULAW_DECODE_TABLE = new Int16Array(256);
 })();
 
 function linearToMulaw(sample) {
-  const MULAW_MAX = 0x1FFF;
+  const MULAW_MAX = 0x1fff;
   const MULAW_BIAS = 33;
 
   let sign = (sample >> 8) & 0x80;
@@ -62,9 +54,9 @@ function linearToMulaw(sample) {
 
   sample += MULAW_BIAS;
   let exponent = 7;
-  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1);
+  for (let expMask = 0x4000; (sample & expMask) === 0 && exponent > 0; exponent--, expMask >>= 1) {}
 
-  let mantissa = (sample >> (exponent + 3)) & 0x0F;
+  let mantissa = (sample >> (exponent + 3)) & 0x0f;
   let mulawByte = ~(sign | (exponent << 4) | mantissa);
 
   return mulawByte & 0xff;
@@ -118,7 +110,6 @@ function generateSilence16k(durationMs) {
 }
 
 // -------------------- VAD --------------------
-
 class SimpleVAD {
   constructor(config = VAD_CONFIG) {
     this.config = config;
@@ -212,7 +203,6 @@ class SimpleVAD {
 }
 
 // -------------------- ElevenLabs Client --------------------
-
 class ElevenLabsClient {
   constructor(apiKey, agentId, onAudio, onAgentStateChange) {
     this.apiKey = apiKey;
@@ -331,7 +321,7 @@ class ElevenLabsClient {
         break;
 
       case "interruption":
-        console.log("[ElevenLabs] ⚠️ Interruption event (from server)");
+        console.log("[ElevenLabs] ⚠️ Interruption event");
         this.isAgentSpeaking = false;
         this.hasReceivedAudio = false;
         this.onAgentStateChange?.(false);
@@ -344,7 +334,10 @@ class ElevenLabsClient {
       }
 
       case "conversation_initiation_metadata":
-        console.log("[ElevenLabs] Session initialized, config:", JSON.stringify(message.conversation_initiation_metadata_event || {}).substring(0, 200));
+        console.log(
+          "[ElevenLabs] Session initialized, config:",
+          JSON.stringify(message.conversation_initiation_metadata_event || {}).substring(0, 200)
+        );
         break;
 
       default:
@@ -395,7 +388,7 @@ class ElevenLabsClient {
     this.agentAudioTimeout = setTimeout(() => {
       if (this.isAgentSpeaking) {
         console.log("[ElevenLabs] ⏱️ Agent audio timeout - pending turn end (wait queue drain)");
-        this.onAgentStateChange?.(false, true); // pending
+        this.onAgentStateChange?.(false, true);
       }
     }, AGENT_AUDIO_TIMEOUT_MS);
   }
@@ -407,7 +400,6 @@ class ElevenLabsClient {
 }
 
 // -------------------- Call Session --------------------
-
 class CallSession {
   constructor(streamSid, twilioWs) {
     this.streamSid = streamSid;
@@ -421,12 +413,10 @@ class CallSession {
 
     this.waitingForGreeting = true;
 
-    // Twilio output queue (mu-law bytes)
     this.outQueue = Buffer.alloc(0);
     this.playInterval = null;
     this.framesSent = 0;
 
-    // Stats
     this.userChunksSent = 0;
 
     this.greetingTimeout = null;
@@ -496,12 +486,10 @@ class CallSession {
     }
 
     if (isPending) {
-      // Wait for queue drain before allowing user
       this.startQueueDrainCheck();
       return;
     }
 
-    // Definitive end
     this.agentSpeaking = false;
     console.log(`[Session ${this.streamSid}] Agent finished - ready for user input`);
     this.vad.resetForNewTurn();
@@ -511,4 +499,99 @@ class CallSession {
     const checkInterval = setInterval(() => {
       if (!this.isActive) return clearInterval(checkInterval);
 
-      // queue nearly empty =>
+      if (this.outQueue.length < TWILIO_FRAME_SIZE * 2) {
+        clearInterval(checkInterval);
+        this.agentSpeaking = false;
+        console.log(`[Session ${this.streamSid}] Agent finished (queue drained) - ready for user input`);
+        this.vad.resetForNewTurn();
+      }
+    }, 100);
+
+    setTimeout(() => {
+      clearInterval(checkInterval);
+      if (this.agentSpeaking) {
+        this.agentSpeaking = false;
+        console.log(`[Session ${this.streamSid}] Agent finished (timeout) - ready for user input`);
+        this.vad.resetForNewTurn();
+      }
+    }, 5000);
+  }
+
+  processIncomingAudio(base64Mulaw) {
+    if (!this.isActive) return;
+    if (!this.elevenLabs?.isConnected || !this.elevenLabs?.isSessionReady) return;
+
+    if (this.waitingForGreeting) return;
+
+    // anti-echo gate
+    if (this.agentSpeaking || this.outQueue.length >= TWILIO_FRAME_SIZE * 2) return;
+
+    try {
+      const mulawBuffer = Buffer.from(base64Mulaw, "base64");
+      const pcm8k = decodeMulaw(mulawBuffer);
+
+      const vadResult = this.vad.processFrame(pcm8k, this.streamSid.substring(0, 8));
+
+      if (vadResult.shouldSendAudio) {
+        const pcm16k = upsample8to16(pcm8k);
+        const base64Pcm = pcm16ToBase64(pcm16k);
+
+        if (this.elevenLabs.sendAudio(base64Pcm)) {
+          this.userChunksSent++;
+          this.vad.incrementAudioChunks();
+          if (this.userChunksSent % 100 === 0) {
+            console.log(`[Session ${this.streamSid}] Sent ${this.userChunksSent} audio chunks to ElevenLabs`);
+          }
+        }
+      }
+
+      if (vadResult.turnEnded) {
+        if (this.vad.hasEnoughAudioForCommit()) {
+          console.log(`[Session ${this.streamSid}] ⚡ User turn ended (${vadResult.silenceMs}ms silence, ${this.vad.audioChunksSent} chunks)`);
+          this.elevenLabs.endTurn();
+          this.agentSpeaking = true;
+        } else {
+          console.log(`[Session ${this.streamSid}] 🔇 Turn ended but not enough audio (${this.vad.audioChunksSent} chunks) - ignoring`);
+          this.vad.resetForNewTurn();
+        }
+      }
+    } catch (err) {
+      console.error(`[Session ${this.streamSid}] Audio processing error:`, err);
+    }
+  }
+
+  handleElevenLabsAudio(base64Pcm) {
+    if (!this.isActive) return;
+
+    try {
+      const pcm16k = base64ToPcm16(base64Pcm);
+      const pcm8k = downsample16to8(pcm16k);
+      const mulawBuffer = encodeMulaw(pcm8k);
+
+      this.enqueueToTwilio(mulawBuffer);
+    } catch (err) {
+      console.error(`[Session ${this.streamSid}] Audio transcode error:`, err);
+    }
+  }
+
+  close() {
+    console.log(`[Session ${this.streamSid}] Closing - sent ${this.userChunksSent} user audio chunks, played ${this.framesSent} frames to Twilio`);
+    this.isActive = false;
+
+    if (this.greetingTimeout) clearTimeout(this.greetingTimeout);
+    if (this.greetingFallbackTimeout) clearTimeout(this.greetingFallbackTimeout);
+    if (this.playInterval) clearInterval(this.playInterval);
+
+    this.elevenLabs?.close();
+  }
+}
+
+// -------------------- HTTP + WS server --------------------
+const server = http.createServer((req, res) => {
+  if (req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", timestamp: new Date().toISOString() }));
+    return;
+  }
+
+  if (req.url === "/twiml") {
